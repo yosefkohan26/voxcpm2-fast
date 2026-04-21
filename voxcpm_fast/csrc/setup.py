@@ -96,10 +96,19 @@ chained_ext = CUDAExtension(
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
 )
 
+# P2.5.2 — DiT persistent megakernel. Cooperative launch with
+# cg::this_grid().sync() between phases. First commit is a no-op
+# scaffolding kernel; subsequent commits grow it into the full fused DiT.
+mk_dit_ext = CUDAExtension(
+    name="mk_dit_prefill_ext",
+    sources=[str(VOXCPM_FAST / "megakernels" / "mk_dit_prefill.cu")],
+    extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
+)
+
 setup(
     name="voxcpm_fast_exts",
-    version="0.0.3",
-    description="VoxCPM2-Fast CUDA extensions (P2.1 + P2.2 coop + P2.2 chained)",
-    ext_modules=[ext, fused_ext, chained_ext],
+    version="0.0.4",
+    description="VoxCPM2-Fast CUDA extensions (P2.1 PoC + P2.2 coop + P2.2 chained + P2.5.2 DiT megakernel)",
+    ext_modules=[ext, fused_ext, chained_ext, mk_dit_ext],
     cmdclass={"build_ext": BuildExtension.with_options(use_ninja=True)},
 )
