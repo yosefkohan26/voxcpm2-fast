@@ -158,16 +158,39 @@ def _apply_shims(model, model_config, *, enable_feat_encoder, enable_dit,
     if enable_dit:
         dit_cfg = model_config.dit_config
         dit = model.feat_decoder.estimator.decoder
+        fused_dit = _build_fused_cpm4(
+            dit,
+            hidden=dit_cfg.hidden_dim,
+            intermediate=dit_cfg.ffn_dim,
+            num_layers=dit_cfg.num_layers,
+            causal=False,
+            use_rope=True,
+            rms_eps=rms_eps,
+        )
+        # L2 persistence hint for DiT weights: measured at +1.5 ms
+        # REGRESSION vs OFF in isolation (daemon A/B, 15 trials each).
+        # Root cause: the per-DiT-call cudaStreamSetAttribute + reset ops
+        # get captured into the graph and replayed 18× per prefill; their
+        # overhead exceeds the L2 savings on the 204 MB of DiT weights.
+        # Also reserving 60 MB of L2 for persisting reduces the share
+        # available to base_lm's much larger working set, causing extra
+        # thrash there. Disabled by default; opt-in via
+        # VOXCPM_L2_PERSIST=1 to re-evaluate on other hardware.
+        if os.environ.get("VOXCPM_L2_PERSIST") == "1":
+            try:
+                from fused_layer_chained import _ext as _chained_ext
+                _chained_ext.set_persisting_l2_limit(60 * 1024 * 1024)
+                fused_dit.install_l2_persist(max_window_bytes=128 * 1024 * 1024)
+                if verbose:
+                    base_ptr, nbytes = fused_dit._l2_persist_range
+                    print(f"[voxcpm_fast] DiT L2 persist (opt-in): "
+                          f"base=0x{base_ptr:x} size={nbytes/1024/1024:.1f} MB",
+                          flush=True)
+            except Exception as e:
+                print(f"[voxcpm_fast] DiT L2 persist skipped: {e}", flush=True)
+
         shim = FusedCpm4ModelShim(
-            _build_fused_cpm4(
-                dit,
-                hidden=dit_cfg.hidden_dim,
-                intermediate=dit_cfg.ffn_dim,
-                num_layers=dit_cfg.num_layers,
-                causal=False,
-                use_rope=True,
-                rms_eps=rms_eps,
-            ),
+            fused_dit,
             hidden=dit_cfg.hidden_dim,
         ).cuda().eval()
         model.feat_decoder.estimator.decoder = shim
@@ -217,6 +240,14 @@ def install_prefill_graph_capture(n_buckets=(16, 32, 64, 128, 256, 512)) -> None
             return _orig_forward(self, positions, text_tokens, feat,
                                  feat_mask, temperature, cfg_value)
 
+        # Capture separate variants for text-only vs with-voice-prompt. For
+        # text-only requests (feat_mask all-False), the captured graph
+        # substitutes a zeros tensor for the feat_encoder output, skipping
+        # the whole 12-layer non-causal encoder. Saves ~0.3-0.5 ms at
+        # bucket=16 and more at larger buckets.
+        has_feat = bool(feat_mask.any().item())  # one-shot D2H sync, ~20 µs
+        bucket_key = (bucket, has_feat)
+
         cache = getattr(self, "_prefill_graphs", None)
         if cache is None:
             cache = {}
@@ -224,7 +255,7 @@ def install_prefill_graph_capture(n_buckets=(16, 32, 64, 128, 256, 512)) -> None
 
         from nanovllm_voxcpm.utils.context import set_context, reset_context, get_context
 
-        if bucket not in cache:
+        if bucket_key not in cache:
             # Capture.
             import time as _t
             t0 = _t.time()
@@ -252,45 +283,71 @@ def install_prefill_graph_capture(n_buckets=(16, 32, 64, 128, 256, 512)) -> None
             # block_tables and context_lens are prefill-irrelevant but the
             # graph-captured attention call passes them through. Set None.
 
-            # Warmup (default stream).
-            set_context(True, cu_q, cu_k, bucket, bucket, slot, None, None)
-            try:
-                for _ in range(3):
-                    _ = _orig_forward(self, pb, tb, fb, mb, temp_b, cfg_b)
-            finally:
-                reset_context()
-            torch.cuda.synchronize()
+            # For has_feat=False (text-only) variants, replace the
+            # feat_encoder with a no-op that returns zeros of the
+            # correct shape. feat_encoder runs on the zero feat tensor
+            # and its output is always masked to zero by the downstream
+            # `torch.where(feat_mask, feat_embeds, text_embeds)` — the
+            # encoder is pure waste for text-only. Zeroing the output
+            # directly saves its 12-layer compute.
+            _orig_feat_encoder_forward = None
+            if not has_feat:
+                fenc = self.feat_encoder
+                _orig_feat_encoder_forward = fenc.forward
+                enc_hidden = fenc.encoder.fused.hidden if hasattr(fenc.encoder, "fused") \
+                    else fenc.encoder.config.hidden_dim  # fallback — never hit on fast path
+                def _zero_feat_encoder(x, _eh=enc_hidden):
+                    B = x.size(0)
+                    return torch.zeros(B, _eh, device=x.device, dtype=x.dtype)
+                fenc.forward = _zero_feat_encoder
 
-            # Side-stream warmup per PyTorch recipe.
-            cs = torch.cuda.Stream()
-            cs.wait_stream(torch.cuda.current_stream())
-            set_context(True, cu_q, cu_k, bucket, bucket, slot, None, None)
             try:
-                with torch.cuda.stream(cs):
+                # Warmup (default stream).
+                set_context(True, cu_q, cu_k, bucket, bucket, slot, None, None)
+                try:
                     for _ in range(3):
                         _ = _orig_forward(self, pb, tb, fb, mb, temp_b, cfg_b)
-            finally:
-                reset_context()
-            torch.cuda.current_stream().wait_stream(cs)
-            torch.cuda.synchronize()
+                finally:
+                    reset_context()
+                torch.cuda.synchronize()
 
-            # Capture with cu_q = [0, bucket]. At replay we'll overwrite to
-            # [0, N_real]. Flash-attn varlen reads cu_seqlens dynamically, and
-            # `last_indices = cu_seqlens_q[1:] - 1` is a baked tensor subtraction
-            # that rereads cu_seqlens_q at replay, so lm_hidden indexing picks
-            # enc_outputs[N_real - 1] correctly.
-            g = torch.cuda.CUDAGraph()
-            set_context(True, cu_q, cu_k, bucket, bucket, slot, None, None)
-            try:
-                with torch.cuda.graph(g):
-                    out = _orig_forward(self, pb, tb, fb, mb, temp_b, cfg_b)
+                # Side-stream warmup per PyTorch recipe.
+                cs = torch.cuda.Stream()
+                cs.wait_stream(torch.cuda.current_stream())
+                set_context(True, cu_q, cu_k, bucket, bucket, slot, None, None)
+                try:
+                    with torch.cuda.stream(cs):
+                        for _ in range(3):
+                            _ = _orig_forward(self, pb, tb, fb, mb, temp_b, cfg_b)
+                finally:
+                    reset_context()
+                torch.cuda.current_stream().wait_stream(cs)
+                torch.cuda.synchronize()
+
+                # Capture with cu_q = [0, bucket]. At replay we'll overwrite to
+                # [0, N_real]. Flash-attn varlen reads cu_seqlens dynamically, and
+                # `last_indices = cu_seqlens_q[1:] - 1` is a baked tensor subtraction
+                # that rereads cu_seqlens_q at replay, so lm_hidden indexing picks
+                # enc_outputs[N_real - 1] correctly.
+                g = torch.cuda.CUDAGraph()
+                set_context(True, cu_q, cu_k, bucket, bucket, slot, None, None)
+                try:
+                    with torch.cuda.graph(g):
+                        out = _orig_forward(self, pb, tb, fb, mb, temp_b, cfg_b)
+                finally:
+                    reset_context()
             finally:
-                reset_context()
-            cache[bucket] = (g, pb, tb, fb, mb, temp_b, cfg_b, out, cu_q, cu_k, slot)
+                # Restore the real feat_encoder for future captures / other
+                # code paths that do use it.
+                if _orig_feat_encoder_forward is not None:
+                    self.feat_encoder.forward = _orig_feat_encoder_forward
+
+            cache[bucket_key] = (g, pb, tb, fb, mb, temp_b, cfg_b, out, cu_q, cu_k, slot)
+            variant = "text-only" if not has_feat else "voice-prompt"
             print(f"[voxcpm_fast] captured VoxCPM2Model.forward @ N={bucket} "
-                  f"in {(_t.time()-t0)*1000:.0f} ms", flush=True)
+                  f"[{variant}] in {(_t.time()-t0)*1000:.0f} ms", flush=True)
 
-        g, pb, tb, fb, mb, temp_b, cfg_b, out, cu_q, cu_k, slot = cache[bucket]
+        g, pb, tb, fb, mb, temp_b, cfg_b, out, cu_q, cu_k, slot = cache[bucket_key]
 
         # ---- Write real request data + context into captured tensors ----
         real_ctx = get_context()

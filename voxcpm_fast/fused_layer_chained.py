@@ -393,6 +393,34 @@ class FusedCpm4Model:
         assert self.w_final_norm.is_cuda and self.w_final_norm.dtype == torch.bfloat16
         assert tuple(self.w_final_norm.shape) == (hidden,)
 
+        # L2 persistence range (populated lazily by install_l2_persist).
+        self._l2_persist_range: tuple[int, int] | None = None
+
+    def install_l2_persist(self, max_window_bytes: int = 128 * 1024 * 1024) -> None:
+        """Compute the pointer range spanning this model's layer weights and
+        store it so `forward()` can mark it as hitProp=Persisting before a
+        call. The CUDA ``cudaAccessPolicyWindow`` is limited to
+        ``cudaDevAttrMaxAccessPolicyWindowSize`` (128 MB on sm_120a).
+
+        If our weights are scattered across more than `max_window_bytes`,
+        we clamp the window to start at the first weight's pointer and
+        cover as much as we can — PyTorch's caching allocator generally
+        groups sequential allocations nearby, so weights allocated
+        back-to-back get partial coverage for free.
+        """
+        ptrs: list[tuple[int, int]] = []  # (ptr, bytes)
+        for layer in self.layers:
+            for t in (layer.w_in_ln, layer.w_qkv, layer.w_o, layer.w_post_ln,
+                      layer.w_gu, layer.w_dn):
+                ptrs.append((t.data_ptr(), t.numel() * t.element_size()))
+        ptrs.append((self.w_final_norm.data_ptr(),
+                     self.w_final_norm.numel() * self.w_final_norm.element_size()))
+        min_ptr = min(p for p, _ in ptrs)
+        max_end = max(p + sz for p, sz in ptrs)
+        span = max_end - min_ptr
+        win_bytes = min(span, max_window_bytes)
+        self._l2_persist_range = (min_ptr, win_bytes)
+
     def forward(
         self,
         input_embeds: torch.Tensor,
@@ -451,6 +479,18 @@ class FusedCpm4Model:
             side = torch.cuda.Stream()
             evt = torch.cuda.Event()
 
+        # L2 persistence hint: mark our model's weights as preferred-to-keep
+        # in L2 so cross-iteration reuse (e.g. 9 Euler DiT calls) doesn't
+        # keep paying HBM for the same weights. Only active when:
+        #   (a) the model has an `_l2_persist_range` attribute (pointer + bytes)
+        #   (b) VOXCPM_L2_PERSIST env is not "0" (runtime disable).
+        persist = getattr(self, "_l2_persist_range", None)
+        if persist is not None and os.environ.get("VOXCPM_L2_PERSIST", "1") != "0":
+            base_ptr, nbytes = persist
+            _ext.set_l2_persist_window(base_ptr, nbytes, 1.0)
+        else:
+            persist = None  # skip the matching clear below
+
         for i, layer in enumerate(self.layers):
             if prefetch and i + 1 < len(self.layers):
                 nxt = self.layers[i + 1]
@@ -467,6 +507,9 @@ class FusedCpm4Model:
 
         if prefetch:
             torch.cuda.current_stream().wait_stream(side)
+
+        if persist is not None:
+            _ext.clear_l2_persist_window()
 
         out = _ext.rmsnorm(hs, self.w_final_norm, self.rms_eps)
         return out[:orig_M] if pad > 0 else out

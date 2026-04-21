@@ -1771,6 +1771,89 @@ void vcpm_l2_warm(const torch::Tensor& t) {
 
 
 // ===========================================================================
+// L2 cache persistence control.
+// ===========================================================================
+//
+// CUDA lets us reserve a portion of L2 for "persisting" data and mark a
+// specific pointer range as preferred-to-persist via
+// cudaStreamAttributeAccessPolicyWindow. On sm_120a (RTX 5090) the max
+// persisting budget is 60 MB of the 96 MB L2.
+//
+// Motivation: DiT's 204 MB of weights (12 layers × 17 MB each) gets read
+// 9× per prefill (once per Euler iter). Without persistence, L2 sees each
+// layer evicted by the next, so every Euler iter re-reads all 204 MB
+// from HBM (= 1836 MB). With a 60 MB persisting window, ~3.5 layers stay
+// warm, cutting HBM traffic on those layers by 8× (they're read once,
+// reused 9 times).
+//
+// Usage from Python:
+//   _ext.set_persisting_l2_limit(60 * 1024 * 1024)   # once at init
+//   _ext.set_l2_persist_window(base_ptr, num_bytes)  # before DiT
+//   _ext.clear_l2_persist_window()                   # after DiT (to avoid
+//                                                      # polluting other passes)
+
+void vcpm_set_persisting_l2_limit(int64_t bytes) {
+    // Reserve part of L2 for data marked as Persisting.
+    // cudaLimitPersistingL2CacheSize = 0x08
+    TORCH_CHECK(bytes >= 0, "bytes must be non-negative");
+    auto err = cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, (size_t)bytes);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, ", bytes,
+                ") failed: ", cudaGetErrorString(err));
+}
+
+
+void vcpm_set_l2_persist_window(int64_t base_ptr, int64_t num_bytes,
+                                double hit_ratio) {
+    TORCH_CHECK(base_ptr != 0, "base_ptr null");
+    TORCH_CHECK(num_bytes > 0, "num_bytes must be > 0");
+    TORCH_CHECK(hit_ratio >= 0.0 && hit_ratio <= 1.0, "hit_ratio in [0, 1]");
+
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    cudaStreamAttrValue attr{};
+    attr.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(base_ptr);
+    attr.accessPolicyWindow.num_bytes = (size_t)num_bytes;
+    attr.accessPolicyWindow.hitRatio  = (float)hit_ratio;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+
+    auto err = cudaStreamSetAttribute(
+        stream.stream(),
+        cudaStreamAttributeAccessPolicyWindow,
+        &attr);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaStreamSetAttribute(AccessPolicyWindow) failed: ",
+                cudaGetErrorString(err));
+}
+
+
+void vcpm_clear_l2_persist_window() {
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaStreamAttrValue attr{};
+    // Zeroed window = disabled.
+    attr.accessPolicyWindow.base_ptr  = nullptr;
+    attr.accessPolicyWindow.num_bytes = 0;
+    attr.accessPolicyWindow.hitRatio  = 0.0f;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyNormal;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyNormal;
+
+    auto err = cudaStreamSetAttribute(
+        stream.stream(),
+        cudaStreamAttributeAccessPolicyWindow,
+        &attr);
+    TORCH_CHECK(err == cudaSuccess,
+                "cudaStreamSetAttribute(clear) failed: ",
+                cudaGetErrorString(err));
+    // Flush any cached persisting lines so subsequent passes can use
+    // those cache lines normally. Swallow the error (Not all drivers
+    // expose this as a cudaError_t-returning API — if it fails we just
+    // lose a bit of L2 freshness which doesn't matter for correctness).
+    cudaCtxResetPersistingL2Cache();
+}
+
+
+// ===========================================================================
 // Binding table.
 // ===========================================================================
 
@@ -1805,6 +1888,23 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Issue dummy volatile loads of the tensor to populate L2 cache. "
           "Meant for running on a side stream concurrently with compute; the "
           "target tensor's bytes will be L2-resident when next read from a GEMM.");
+    m.def("set_persisting_l2_limit", &vcpm_set_persisting_l2_limit,
+          "cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, bytes). "
+          "Reserves part of L2 for data marked as Persisting via "
+          "set_l2_persist_window. On sm_120a (RTX 5090) the hardware ceiling "
+          "is ~60 MB of the 96 MB L2.",
+          pybind11::arg("bytes"));
+    m.def("set_l2_persist_window", &vcpm_set_l2_persist_window,
+          "Set the current stream's cudaAccessPolicyWindow so reads within "
+          "[base_ptr, base_ptr+num_bytes) are marked hitProp=Persisting. "
+          "num_bytes may not exceed the device's MaxAccessPolicyWindowSize "
+          "(128 MB on sm_120a).",
+          pybind11::arg("base_ptr"),
+          pybind11::arg("num_bytes"),
+          pybind11::arg("hit_ratio") = 1.0);
+    m.def("clear_l2_persist_window", &vcpm_clear_l2_persist_window,
+          "Reset the current stream's access policy window and flush any "
+          "persisting L2 lines.");
     m.def("fused_pre_attn", &vcpm_fused_pre_attn,
           "P2.5.1.c fused rmsnorm + qkv_gemm + rope for base_lm shape "
           "(H=2048, QKV_DIM=2560, NUM_Q=16, NUM_KV=2, D=128). "
