@@ -385,6 +385,105 @@ def install_prefill_graph_capture(n_buckets=(16, 32, 64, 128, 256, 512)) -> None
     VoxCPM2Runner.__init__ = runner_init
 
 
+def install_graphed_phase_probe() -> None:
+    """Rewrite VoxCPM2Model.forward with inline CUDA event records (no sync)
+    so they get captured into the outer prefill graph. Events are shared
+    across calls. After each replay, the probe syncs + prints elapsed times
+    between consecutive events for the JUST-replayed graph.
+
+    Enable with VOXCPM_GRAPHED_PROBE=1. Must be installed BEFORE
+    install_prefill_graph_capture.
+    """
+    import os as _os
+    if _os.environ.get("VOXCPM_GRAPHED_PROBE") != "1":
+        return
+    import torch
+    from nanovllm_voxcpm.models.voxcpm2.model import VoxCPM2Model
+
+    labels = ["start", "feat_enc", "embed", "base_lm", "fsq+fuse",
+              "res_lm", "dit", "stop"]
+    # One event per boundary; reused across replays. Graph capture will
+    # bake the record() calls into the captured stream.
+    evs = [torch.cuda.Event(enable_timing=True) for _ in labels]
+    state = {"ready": False}
+
+    # Keep reference to the original so we can fall back during engine's
+    # decode-graph warmup (cu_seqlens_q is None there).
+    _orig_for_probe = VoxCPM2Model.forward
+
+    def forward_probed(self, positions, text_tokens, feat, feat_mask,
+                       temperature, cfg_value):
+        from nanovllm_voxcpm.utils.context import get_context
+        ctx = get_context()
+        if ctx.cu_seqlens_q is None or not ctx.is_prefill:
+            return _orig_for_probe(self, positions, text_tokens, feat,
+                                   feat_mask, temperature, cfg_value)
+
+        evs[0].record()
+        feat_embeds = self.enc_to_lm_proj(self.feat_encoder(feat))
+        feat_embeds = torch.masked_fill(feat_embeds, feat_mask.unsqueeze(-1).logical_not(), 0)
+        evs[1].record()
+
+        text_embeds = self.base_lm.embed_tokens(text_tokens)
+        combined_embeds = torch.where(feat_mask.unsqueeze(-1), feat_embeds, text_embeds)
+        evs[2].record()
+
+        enc_outputs = self.base_lm(combined_embeds, positions)
+        enc_outputs = torch.where(feat_mask.unsqueeze(-1), self.fsq_layer(enc_outputs), enc_outputs)
+        evs[3].record()
+
+        last_indices = ctx.cu_seqlens_q[1:] - 1
+        lm_hidden = enc_outputs[last_indices].contiguous()
+        residual_inputs = self.fusion_concat_proj(
+            torch.cat([enc_outputs, torch.where(feat_mask.unsqueeze(-1), feat_embeds, 0)], dim=-1)
+        )
+        evs[4].record()
+
+        ralm_outputs = self.residual_lm(residual_inputs, positions)
+        ralm_hidden = ralm_outputs[last_indices].contiguous()
+        prefix_feat_cond = feat[last_indices].contiguous()
+        evs[5].record()
+
+        dit_hidden = torch.cat([self.lm_to_dit_proj(lm_hidden), self.res_to_dit_proj(ralm_hidden)], dim=-1)
+        pred_feat = self.feat_decoder(
+            mu=dit_hidden,
+            cond=prefix_feat_cond.transpose(1, 2).contiguous(),
+            temperature=temperature,
+            cfg_value=cfg_value,
+        ).transpose(1, 2)
+        evs[6].record()
+
+        stop_flag = self.stop_head(self.stop_actn(self.stop_proj(lm_hidden))).argmax(dim=-1)
+        evs[7].record()
+        state["ready"] = True
+        return {"latents": pred_feat, "stop_flag": stop_flag}
+
+    VoxCPM2Model.forward = forward_probed
+
+    # After outer prefill graph replay, sync + dump event deltas.
+    from nanovllm_voxcpm.models.voxcpm2.runner import VoxCPM2Runner
+    _orig_run = VoxCPM2Runner.run
+    counter = {"n": 0}
+
+    def run_with_dump(self, seqs, is_prefill):
+        out = _orig_run(self, seqs, is_prefill)
+        if is_prefill and state["ready"]:
+            torch.cuda.synchronize()
+            counter["n"] += 1
+            try:
+                ms = lambda i: evs[i].elapsed_time(evs[i + 1])
+                parts = [f"{labels[i+1]}={ms(i):5.2f}" for i in range(len(labels) - 1)]
+                total = evs[0].elapsed_time(evs[-1])
+                print(f"[graphed probe #{counter['n']:03d}] total={total:5.2f}  " + "  ".join(parts), flush=True)
+            except Exception as e:
+                # Captured events + graph replay are fragile; swallow and move on.
+                pass
+        return out
+
+    VoxCPM2Runner.run = run_with_dump
+    print("[voxcpm_fast] graphed-phase probe installed", flush=True)
+
+
 def install_model_forward_probe() -> None:
     """Split the graphed-replay model.forward into fine-grained phases so we
     can see where the 22 ms goes (base_lm vs DiT vs projections vs VAE).

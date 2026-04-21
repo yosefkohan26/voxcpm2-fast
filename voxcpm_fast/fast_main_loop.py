@@ -45,15 +45,25 @@ def fast_main_loop(queue_in, queue_out, args, kwargs):
     # default; set VOXCPM_PREFETCH=0 to disable for A/B.
     os.environ.setdefault("VOXCPM_PREFETCH", "l2")
 
+    # NOTE: upstream's kvcache_block_size = 256 is a flash_attn paged-KV
+    # hard requirement ("Paged KV cache block size must be divisible by
+    # 256"), not user-paranoia. Shorter voice prompts (~80-200 tokens)
+    # therefore cannot use the block-hash prefix cache as-is. A proper
+    # speaker-prompt cache (feat_encoder output + base_lm K/V for the
+    # prompt prefix) is tracked as PROJECT_PLAN P2.8.
+
     from voxcpm_fast.engine_hook import (
         install_fast_path, install_prefill_graph_capture, install_timing_probe,
-        install_model_forward_probe,
+        install_model_forward_probe, install_graphed_phase_probe,
     )
     install_fast_path(enable_feat_encoder=enc, enable_dit=dit,
                       enable_base_lm=base, enable_residual_lm=res)
     # Install forward probe BEFORE graph capture so the probe's wrapper
     # becomes what gets captured (and thus skipped at replay).
     install_model_forward_probe()
+    # Inline-event probe of the captured graph: records events INSIDE the
+    # graph body so their timestamps update each replay.
+    install_graphed_phase_probe()
     if os.environ.get("VOXCPM_PREFILL_GRAPH", "1") != "0":
         install_prefill_graph_capture()
     if os.environ.get("VOXCPM_TIMING") == "1":
