@@ -1,0 +1,21 @@
+.venv/
+.uv_cache/
+hf_cache/
+models/
+logs/
+voxcpm_fast/profiles/*.nsys-rep
+voxcpm_fast/profiles/*.qdrep
+voxcpm_fast/profiles/*.ncu-rep
+voxcpm_fast/profiles/*.sqlite
+voxcpm_fast/**/__pycache__/
+voxcpm_fast/**/*.pyc
+voxcpm_fast/**/*.so
+voxcpm_fast/build/
+*.wav
+*.pt
+*.pth
+*.safetensors
+
+# nanovllm-voxcpm is an upstream clone; track the pyproject change we need, skip the rest
+nanovllm-voxcpm/.venv/
+nanovllm-voxcpm/uv.lock
