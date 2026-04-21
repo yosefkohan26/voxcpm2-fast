@@ -1206,6 +1206,284 @@ static void mk_dit_step2b1_launch(
 }
 
 
+// Phase: silu_mul. Input gu is [M, 2I] bf16 (gate||up); output out is [M, I] bf16.
+// out[t, j] = silu(gu[t, j]) * gu[t, I + j]. Elementwise, strided.
+__device__ __forceinline__ void mk_phase_silu_mul(
+        const __nv_bfloat16* __restrict__ gu,
+        __nv_bfloat16* __restrict__ out,
+        int M, int I) {
+    int total = M * I;
+    int stride = gridDim.x * blockDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total; idx += stride) {
+        int t = idx / I;
+        int j = idx % I;
+        float g = __bfloat162float(gu[t * (2 * I) + j]);
+        float u = __bfloat162float(gu[t * (2 * I) + I + j]);
+        float s = g / (1.f + __expf(-g));
+        out[idx] = __float2bfloat16(s * u);
+    }
+}
+
+
+// ---- Step 2b.2 megakernel: full single-DiT-layer — all 9 phases ----
+//
+// Phases (M=64 padded, H=1024, INTER=4096, QKV=2560, Q_DIM=2048, KV_DIM=256):
+//   1. ln_out     = RMSNorm(hs, w_in_ln)                  [M, H]
+//   2. qkv        = ln_out @ w_qkv^T                       [M, QKV]
+//   3. RoPE in-place on qkv (Q and K halves)               [M, QKV]
+//   4. attn_out   = NonCausalAttention(qkv)                [M, Q_DIM]
+//   5. hs_attn    = attn_out @ w_o^T + hs                  [M, H]      (residual)
+//   6. ln2_out    = RMSNorm(hs_attn, w_post_ln)            [M, H]
+//   7. gu         = ln2_out @ w_gu^T                        [M, 2*INTER]
+//   8. mid        = silu(gu[:, :INTER]) * gu[:, INTER:2*INTER]  [M, INTER]
+//   9. layer_out  = mid @ w_dn^T + hs_attn                  [M, H]      (residual)
+//
+// Scratch buffers (each sized to its natural row-stride — CAN'T alias a
+// [M, 1024] view onto a [M, 4096] buffer because the helpers all read
+// the contiguous-row-major layout that matches the buffer's last-dim
+// extent; mixing strides would require per-call stride args, which
+// would bloat the helpers' signatures):
+//   scratch_ln      [M, 1024]   — ln_out (p1)  /  ln2_out (p6, reused)
+//   scratch_qkv     [M, 2560]   — qkv (p2, RoPE'd in p3)
+//   scratch_attn    [M, 2048]   — attn_out (p4, consumed at p5)
+//   scratch_hs_attn [M, 1024]   — post-attn residual (written p5, read p9)
+//   scratch_gu      [M, 8192]   — gate||up (p7, consumed at p8)
+//   scratch_mid     [M, 4096]   — silu(gate)*up (p8, consumed at p9)
+//
+// Block count = MK_COOP_GRID = 64. All 9 phases alias the same 80-KB
+// SMEM region. grid.sync() between phases. Each phase uses whichever
+// fraction of the grid is needed: rmsnorm/rmsnorm2 use all 64 (rows);
+// qkv GEMM 20 tiles; attention 32; o GEMM 8; gate_up GEMM 64; silu all
+// 64; down GEMM 8. Idle blocks skip the phase loop and hit grid.sync.
+extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 2)
+void mk_dit_step2b2_kernel(
+        const __nv_bfloat16* __restrict__ hs,           // [M, 1024] input
+        __nv_bfloat16*       __restrict__ layer_out,    // [M, 1024] final output
+        const __nv_bfloat16* __restrict__ w_in_ln,
+        const __nv_bfloat16* __restrict__ w_qkv,
+        const __nv_bfloat16* __restrict__ w_o,
+        const __nv_bfloat16* __restrict__ w_post_ln,
+        const __nv_bfloat16* __restrict__ w_gu,
+        const __nv_bfloat16* __restrict__ w_dn,
+        const float*         __restrict__ cos_cache,
+        const float*         __restrict__ sin_cache,
+        const int32_t*       __restrict__ positions,
+        __nv_bfloat16*       __restrict__ scratch_ln,      // [M, 1024]
+        __nv_bfloat16*       __restrict__ scratch_qkv,     // [M, 2560]
+        __nv_bfloat16*       __restrict__ scratch_attn,    // [M, 2048]
+        __nv_bfloat16*       __restrict__ scratch_hs_attn, // [M, 1024]
+        __nv_bfloat16*       __restrict__ scratch_gu,      // [M, 8192]
+        __nv_bfloat16*       __restrict__ scratch_mid,     // [M, 4096]
+        int M, int B, int S,
+        float rms_eps, float attn_scale) {
+    cg::grid_group grid = cg::this_grid();
+    extern __shared__ __align__(16) char smem[];
+
+    constexpr int H       = 1024;
+    constexpr int INTER   = 4096;
+    constexpr int QKV_DIM = 2560;
+    constexpr int Q_DIM   = 2048;
+    constexpr int KV_DIM  = 256;
+
+    // Phase 1: ln_out = RMSNorm(hs, w_in_ln) → scratch_ln
+    mk_phase_rmsnorm<H, MK_COOP_BLOCK>(hs, w_in_ln, scratch_ln, M, rms_eps);
+    grid.sync();
+
+    // Phase 2: qkv = ln_out @ w_qkv^T → scratch_qkv
+    mk_phase_gemm<64, 128, 32, 4, false>(
+        scratch_ln, w_qkv, scratch_qkv, nullptr, M, QKV_DIM, H, smem);
+    grid.sync();
+
+    // Phase 3: RoPE in-place on scratch_qkv's Q and K halves (real rows).
+    int N_real = B * S;
+    mk_phase_rope(scratch_qkv, cos_cache, sin_cache, positions,
+                  N_real, 16, 2, 128, Q_DIM, KV_DIM, QKV_DIM);
+    grid.sync();
+
+    // Phase 4: attn_out = NonCausalAttention(qkv) → scratch_attn
+    mk_phase_attention_noncausal_packed<16, 32, 128, 16, 2>(
+        scratch_qkv, scratch_attn, B, S, Q_DIM, KV_DIM, QKV_DIM, attn_scale, smem);
+    grid.sync();
+
+    // Phase 5: hs_attn = attn_out @ w_o^T + hs → scratch_hs_attn
+    mk_phase_gemm<64, 128, 32, 4, true>(
+        scratch_attn, w_o, scratch_hs_attn, hs, M, H, Q_DIM, smem);
+    grid.sync();
+
+    // Phase 6: ln2_out = RMSNorm(hs_attn, w_post_ln) → scratch_ln (reused)
+    mk_phase_rmsnorm<H, MK_COOP_BLOCK>(scratch_hs_attn, w_post_ln, scratch_ln, M, rms_eps);
+    grid.sync();
+
+    // Phase 7: gu = ln2_out @ w_gu^T → scratch_gu
+    mk_phase_gemm<64, 128, 32, 4, false>(
+        scratch_ln, w_gu, scratch_gu, nullptr, M, 2 * INTER, H, smem);
+    grid.sync();
+
+    // Phase 8: mid = silu(gu[:, :INTER]) * gu[:, INTER:2*INTER] → scratch_mid
+    mk_phase_silu_mul(scratch_gu, scratch_mid, M, INTER);
+    grid.sync();
+
+    // Phase 9: layer_out = mid @ w_dn^T + hs_attn → layer_out (residual-fused)
+    mk_phase_gemm<64, 128, 32, 4, true>(
+        scratch_mid, w_dn, layer_out, scratch_hs_attn, M, H, INTER, smem);
+}
+
+
+static void mk_dit_step2b2_launch(
+        const torch::Tensor& hs,
+        torch::Tensor& layer_out,
+        const torch::Tensor& w_in_ln,
+        const torch::Tensor& w_qkv,
+        const torch::Tensor& w_o,
+        const torch::Tensor& w_post_ln,
+        const torch::Tensor& w_gu,
+        const torch::Tensor& w_dn,
+        const torch::Tensor& cos_cache,
+        const torch::Tensor& sin_cache,
+        const torch::Tensor& positions,
+        torch::Tensor& scratch_ln,
+        torch::Tensor& scratch_qkv,
+        torch::Tensor& scratch_attn,
+        torch::Tensor& scratch_hs_attn,
+        torch::Tensor& scratch_gu,
+        torch::Tensor& scratch_mid,
+        int B, int S,
+        double rms_eps, double attn_scale) {
+    int M = (int)hs.size(0);
+
+    constexpr int TM = 64, TN = 128, TK = 32, STAGES = 4;
+    size_t smem_bytes =
+          STAGES * TM * TK * sizeof(__nv_bfloat16)
+        + STAGES * TN * TK * sizeof(__nv_bfloat16)
+        + TM * TN * sizeof(float);
+
+    cudaFuncSetAttribute(
+        mk_dit_step2b2_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+
+    int device = 0;
+    cudaGetDevice(&device);
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+    int blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, (const void*)mk_dit_step2b2_kernel,
+        MK_COOP_BLOCK, smem_bytes);
+    int64_t max_concurrent = (int64_t)sm_count * blocks_per_sm;
+    TORCH_CHECK(MK_COOP_GRID <= max_concurrent,
+                "cooperative limit exceeded: grid=", (int)MK_COOP_GRID,
+                " > sm(", sm_count, ")*per_sm(", blocks_per_sm, ")=", max_concurrent);
+
+    const __nv_bfloat16* hs_p    = reinterpret_cast<const __nv_bfloat16*>(hs.data_ptr());
+    __nv_bfloat16*       lo_p    = reinterpret_cast<__nv_bfloat16*>(layer_out.data_ptr());
+    const __nv_bfloat16* wl_p    = reinterpret_cast<const __nv_bfloat16*>(w_in_ln.data_ptr());
+    const __nv_bfloat16* wq_p    = reinterpret_cast<const __nv_bfloat16*>(w_qkv.data_ptr());
+    const __nv_bfloat16* wo_p    = reinterpret_cast<const __nv_bfloat16*>(w_o.data_ptr());
+    const __nv_bfloat16* wp_p    = reinterpret_cast<const __nv_bfloat16*>(w_post_ln.data_ptr());
+    const __nv_bfloat16* wgu_p   = reinterpret_cast<const __nv_bfloat16*>(w_gu.data_ptr());
+    const __nv_bfloat16* wdn_p   = reinterpret_cast<const __nv_bfloat16*>(w_dn.data_ptr());
+    const float*         cos_p   = cos_cache.data_ptr<float>();
+    const float*         sin_p   = sin_cache.data_ptr<float>();
+    const int32_t*       pos_p   = positions.data_ptr<int32_t>();
+    __nv_bfloat16*       s_ln    = reinterpret_cast<__nv_bfloat16*>(scratch_ln.data_ptr());
+    __nv_bfloat16*       s_qkv   = reinterpret_cast<__nv_bfloat16*>(scratch_qkv.data_ptr());
+    __nv_bfloat16*       s_attn  = reinterpret_cast<__nv_bfloat16*>(scratch_attn.data_ptr());
+    __nv_bfloat16*       s_ha    = reinterpret_cast<__nv_bfloat16*>(scratch_hs_attn.data_ptr());
+    __nv_bfloat16*       s_gu    = reinterpret_cast<__nv_bfloat16*>(scratch_gu.data_ptr());
+    __nv_bfloat16*       s_mid   = reinterpret_cast<__nv_bfloat16*>(scratch_mid.data_ptr());
+    float                eps_f   = (float)rms_eps;
+    float                scl_f   = (float)attn_scale;
+
+    void* args[] = {
+        (void*)&hs_p, (void*)&lo_p,
+        (void*)&wl_p, (void*)&wq_p, (void*)&wo_p,
+        (void*)&wp_p, (void*)&wgu_p, (void*)&wdn_p,
+        (void*)&cos_p, (void*)&sin_p, (void*)&pos_p,
+        (void*)&s_ln, (void*)&s_qkv, (void*)&s_attn,
+        (void*)&s_ha, (void*)&s_gu,  (void*)&s_mid,
+        (void*)&M, (void*)&B, (void*)&S,
+        (void*)&eps_f, (void*)&scl_f,
+    };
+
+    dim3 grid(MK_COOP_GRID);
+    dim3 block(MK_COOP_BLOCK);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        (const void*)mk_dit_step2b2_kernel,
+        grid, block, args, smem_bytes, stream.stream());
+    TORCH_CHECK(err == cudaSuccess, "cudaLaunchCooperativeKernel failed: ",
+                cudaGetErrorString(err));
+}
+
+
+// Full DiT-layer megakernel: 9 phases in ONE cooperative launch.
+// Returns `layer_out` [M, 1024] bf16. Caller pads M to multiple of 64.
+torch::Tensor mk_dit_step2b2_full_layer(
+        const torch::Tensor& hs,
+        const torch::Tensor& w_in_ln,
+        const torch::Tensor& w_qkv,
+        const torch::Tensor& w_o,
+        const torch::Tensor& w_post_ln,
+        const torch::Tensor& w_gu,
+        const torch::Tensor& w_dn,
+        const torch::Tensor& cos_cache,
+        const torch::Tensor& sin_cache,
+        const torch::Tensor& positions,
+        int64_t B, int64_t S,
+        double rms_eps, double attn_scale) {
+    int M = (int)hs.size(0);
+    auto opts = hs.options();
+    auto layer_out       = torch::empty({M, 1024}, opts);
+    auto scratch_ln      = torch::empty({M, 1024}, opts);
+    auto scratch_qkv     = torch::empty({M, 2560}, opts);
+    auto scratch_attn    = torch::empty({M, 2048}, opts);
+    auto scratch_hs_attn = torch::empty({M, 1024}, opts);
+    auto scratch_gu      = torch::empty({M, 8192}, opts);
+    auto scratch_mid     = torch::empty({M, 4096}, opts);
+    mk_dit_step2b2_launch(hs, layer_out,
+                          w_in_ln, w_qkv, w_o, w_post_ln, w_gu, w_dn,
+                          cos_cache, sin_cache, positions,
+                          scratch_ln, scratch_qkv, scratch_attn,
+                          scratch_hs_attn, scratch_gu, scratch_mid,
+                          (int)B, (int)S, rms_eps, attn_scale);
+    return layer_out;
+}
+
+
+// Debug variant: returns all intermediates so tests can diff phase-by-phase.
+std::vector<torch::Tensor> mk_dit_step2b2_full_layer_debug(
+        const torch::Tensor& hs,
+        const torch::Tensor& w_in_ln,
+        const torch::Tensor& w_qkv,
+        const torch::Tensor& w_o,
+        const torch::Tensor& w_post_ln,
+        const torch::Tensor& w_gu,
+        const torch::Tensor& w_dn,
+        const torch::Tensor& cos_cache,
+        const torch::Tensor& sin_cache,
+        const torch::Tensor& positions,
+        int64_t B, int64_t S,
+        double rms_eps, double attn_scale) {
+    int M = (int)hs.size(0);
+    auto opts = hs.options();
+    auto layer_out       = torch::empty({M, 1024}, opts);
+    auto scratch_ln      = torch::empty({M, 1024}, opts);
+    auto scratch_qkv     = torch::empty({M, 2560}, opts);
+    auto scratch_attn    = torch::empty({M, 2048}, opts);
+    auto scratch_hs_attn = torch::empty({M, 1024}, opts);
+    auto scratch_gu      = torch::empty({M, 8192}, opts);
+    auto scratch_mid     = torch::empty({M, 4096}, opts);
+    mk_dit_step2b2_launch(hs, layer_out,
+                          w_in_ln, w_qkv, w_o, w_post_ln, w_gu, w_dn,
+                          cos_cache, sin_cache, positions,
+                          scratch_ln, scratch_qkv, scratch_attn,
+                          scratch_hs_attn, scratch_gu, scratch_mid,
+                          (int)B, (int)S, rms_eps, attn_scale);
+    return {layer_out, scratch_ln, scratch_qkv, scratch_attn,
+            scratch_hs_attn, scratch_gu, scratch_mid};
+}
+
+
 // Python-facing wrapper. Returns the post-attention residual (hs_out).
 torch::Tensor mk_dit_step2b1_partial_layer(
         const torch::Tensor& hs,
@@ -1275,6 +1553,49 @@ PYBIND11_MODULE(mk_dit_prefill_ext, m) {
           pybind11::arg("w_in_ln"),
           pybind11::arg("w_qkv"),
           pybind11::arg("w_o"),
+          pybind11::arg("cos_cache"),
+          pybind11::arg("sin_cache"),
+          pybind11::arg("positions"),
+          pybind11::arg("B"),
+          pybind11::arg("S"),
+          pybind11::arg("rms_eps") = 1e-6,
+          pybind11::arg("attn_scale"));
+
+    m.def("step2b2_full_layer",
+          &voxcpm_fast::mk_dit_step2b2_full_layer,
+          "P2.5.2 Step 2b.2: cooperative 9-phase megakernel — full DiT "
+          "layer in ONE kernel launch. Phases: RMSNorm, QKV GEMM, RoPE, "
+          "NonCausalAttn, O+residual, RMSNorm2, GateUp GEMM, SiLU*mul, "
+          "Down+residual. Matches chained FusedLayer(causal=False, "
+          "hidden=1024) forward at DiT shape.",
+          pybind11::arg("hs"),
+          pybind11::arg("w_in_ln"),
+          pybind11::arg("w_qkv"),
+          pybind11::arg("w_o"),
+          pybind11::arg("w_post_ln"),
+          pybind11::arg("w_gu"),
+          pybind11::arg("w_dn"),
+          pybind11::arg("cos_cache"),
+          pybind11::arg("sin_cache"),
+          pybind11::arg("positions"),
+          pybind11::arg("B"),
+          pybind11::arg("S"),
+          pybind11::arg("rms_eps") = 1e-6,
+          pybind11::arg("attn_scale"));
+
+    m.def("step2b2_full_layer_debug",
+          &voxcpm_fast::mk_dit_step2b2_full_layer_debug,
+          "Debug variant of step2b2_full_layer: returns list "
+          "[layer_out, scratch_ln, scratch_qkv, scratch_attn, "
+          "scratch_hs_attn, scratch_gu, scratch_mid] for phase-by-phase "
+          "diffing against chained reference.",
+          pybind11::arg("hs"),
+          pybind11::arg("w_in_ln"),
+          pybind11::arg("w_qkv"),
+          pybind11::arg("w_o"),
+          pybind11::arg("w_post_ln"),
+          pybind11::arg("w_gu"),
+          pybind11::arg("w_dn"),
           pybind11::arg("cos_cache"),
           pybind11::arg("sin_cache"),
           pybind11::arg("positions"),

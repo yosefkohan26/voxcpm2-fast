@@ -31,6 +31,74 @@ Newest entries at the **top**. Never rewrite prior entries; if you need to retra
 
 ---
 
+### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2b.2: FULL 9-phase single-DiT-layer cooperative megakernel
+
+**Task:** P2.5.2 Step 2b.2 — close the full DiT layer: add RMSNorm2 + gate_up GEMM + silu_mul + down GEMM+residual to the Step 2b.1 megakernel. End state: one `cudaLaunchCooperativeKernel` = one complete DiT layer forward (all 9 phases).
+
+**Files touched:**
+- `voxcpm_fast/megakernels/mk_dit_prefill.cu`:
+  - `mk_phase_silu_mul` __device__ helper — stride-over-total-elements silu*up for gate||up packed input.
+  - `mk_dit_step2b2_kernel` — 9-phase cooperative kernel: 8 `grid.sync()` barriers between the phases.
+  - `mk_dit_step2b2_launch` + `mk_dit_step2b2_full_layer` Python wrapper + `mk_dit_step2b2_full_layer_debug` variant returning all intermediate scratch buffers (+ pybind entries).
+  - Six separate scratch buffers (natural row-strides, NOT aliased): `scratch_ln [M, 1024]`, `scratch_qkv [M, 2560]`, `scratch_attn [M, 2048]`, `scratch_hs_attn [M, 1024]`, `scratch_gu [M, 8192]`, `scratch_mid [M, 4096]`. Each phase writes into one with its natural last-dim stride.
+- `voxcpm_fast/tests/test_mk_dit_step2b2.py` — 2 numerics tests vs chained `FusedLayer(causal=False, hidden=1024)` forward.
+
+**Dead end #1 (caught during test):** First attempt used 3 aliased scratch buffers (scratch_a [M, 4096], scratch_b [M, 8192], scratch_c [M, 1024]). Phase 1 RMSNorm writes with stride H=1024 into a 4096-wide buffer → rows > 0 land at the wrong offsets. Phase 2 read with stride 1024 from the same wrong offsets, so phases 1-2 were self-consistent (by accident!) but phase 6 RMSNorm2 produced corrupted data when reading scratch_a after phase 4 wrote attn_out with stride 2048. Rewrote to use 6 separate scratch buffers with correct natural strides.
+
+**Dead end #2 (caught after scratch fix; this was the actual debug rabbit hole):** With separate scratches the megakernel looked clean but still produced max_abs=1.25 vs chained `FusedLayer.forward(hs_padded, positions, batch_size=B)`. Phase-by-phase debug showed every intermediate was correct (max_abs ≤ 2.3e-02). The bug was in the **reference**, not ours: `FusedLayer.forward` takes `N = hs.size(0)` and assumes `N = batch_size * seq`, so passing hs_padded (M=64) with B=2 makes it do 32-token attention per batch instead of the real 11. Fix: call `_chained_ref(hs_real, ...)` on the un-padded (N=22) rows, compare to megakernel output's first N_real rows.
+
+**Commands:**
+```bash
+PATH=/usr/local/cuda-12.8/bin:$PATH UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  MAX_JOBS=4 nanovllm-voxcpm/.venv/bin/python voxcpm_fast/csrc/setup.py build_ext --inplace
+
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/tests/test_mk_dit_step2b2.py
+
+# Regression
+for t in test_mk_dit_scaffold test_mk_dit_attn_noncausal test_mk_dit_step2b0 test_mk_dit_step2b1; do
+  UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+    nanovllm-voxcpm/.venv/bin/python voxcpm_fast/tests/$t.py
+done
+```
+
+**Results:**
+
+Numerics vs chained `FusedLayer(causal=False, hidden=1024, intermediate=4096)`:
+
+| shape | real_rows | max_abs | mae | max_val |
+|---|---|---|---|---|
+| DiT B=2 S=11 | 22 | **7.812e-03** | 4.701e-05 | 1.562e+00 |
+| Larger B=4 S=32 | 128 | **3.906e-03** | 1.563e-05 | 1.609e+00 |
+
+Both under the 1e-2 bf16 bar. Phase-by-phase error breakdown from debug trace (real rows):
+
+| phase | max_abs | notes |
+|---|---|---|
+| p2 qkv GEMM | 0.0e+00 | bit-exact |
+| p3 RoPE (in-place on qkv) | 0.0e+00 | bit-exact |
+| p4 attention | 1.95e-03 | same as standalone Step 2a |
+| p5 hs_attn (O+residual) | 1.95e-03 | matches Step 2b.1 |
+| p6 ln2 (RMSNorm2) | 1.56e-02 | small compound drift |
+| p7 gu (gate_up GEMM) | 7.81e-03 | |
+| p8 mid (silu_mul) | 2.34e-02 | fp32→bf16 silu roundtrip |
+| p9 layer_out | 7.81e-03 | residual-fused down GEMM, final output |
+
+Regression: all prior tests (scaffold, attention, step2b0, step2b1) still pass.
+
+**Architectural payoff:** Single `cudaLaunchCooperativeKernel` replaces **nine** separate kernel launches that the chained `FusedLayer.forward` issues today (rmsnorm, qkv_gemm, rope_inplace, attention-via-flash_attn, gemm_residual, rmsnorm, gate_up_gemm, silu_mul, gemm_residual). Each launch overhead on sm_120a is ~3 µs graphed / ~10 µs eager, so at 12 layers × 9 Euler iterations × 9 saved launches = ~970 launches saved per DiT prefill, worth ~3-10 ms at the launch-overhead-bound regime. Real win shows up once Steps 3+4 fold layers and Euler iters into the same kernel.
+
+**Next step:** **P2.5.2 Step 3** — 12-layer cooperative kernel. Extend the Step 2b.2 body into an outer `for (int layer = 0; layer < NUM_LAYERS; ++layer)` loop, with weights passed as pointer arrays. Each layer's post-residual hs feeds the next layer's pre-RMSNorm. All 12 layers + their inter-layer `grid.sync()` inside one cooperative launch. Then Step 4 wraps 9 Euler iterations around that; Step 5 wires into the engine behind `VOXCPM_MEGAKERNEL_DIT=1`.
+
+**Hand-off pointers for Step 3 implementer:**
+- Weights: upstream stores `feat_decoder.estimator.decoder.layers.{0..11}` in the safetensors. Build layer-indexed pointer arrays (`const __nv_bfloat16* const* w_in_ln_layers` etc) passed as arguments.
+- Hot buffer: input-hs of layer N+1 is output-hs of layer N. One `hs_current` ping-pong pair should be enough (output of one layer becomes input of next — no need to keep all 12 intermediates).
+- All 6 scratch buffers (`scratch_ln`, `scratch_qkv`, `scratch_attn`, `scratch_hs_attn`, `scratch_gu`, `scratch_mid`) can be **reused across layers** since each layer fully consumes them before the next layer starts. Allocate once; the grid.sync() at the end of each layer gives the full fence.
+- The existing `mk_dit_step2b2_full_layer_debug` wrapper shows the scratch allocation pattern; Step 3 allocates the same 6 scratches ONCE for all 12 layers.
+- Numerics test vs `FusedCpm4Model` (DiT stack) at real DiT shape.
+
+---
+
 ### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2b.1: 5-phase cooperative megakernel (through O+residual)
 
 **Task:** P2.5.2 Step 2b.1 — extend the cooperative megakernel from 2 phases to 5, covering everything up through post-attention residual. Phase list: RMSNorm → QKV GEMM → RoPE → non-causal attention → O GEMM+residual. Remaining 4 phases (RMSNorm2 → gate_up GEMM → silu_mul → down GEMM+residual) land in Step 2b.2.
