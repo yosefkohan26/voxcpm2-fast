@@ -189,6 +189,78 @@ UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache uv run python -c \
    print(flash_attn_func(q,q,q).shape)"
 ```
 
+### Hot iteration via `bench_daemon.py`  **⚡ read this BEFORE running benches**
+
+A fresh `SyncVoxCPM2ServerPool` startup pays **~40 s model load + ~20 s bucket pre-warm** before the first trial. Sweeping N one-off benches costs N × 60 s.
+
+Instead, load the model ONCE into a long-lived daemon and fire JSON commands over a FIFO. One bench then takes **~3-4 s** (15-20× speedup for env-toggle A/Bs).
+
+**Setup:**
+```bash
+VPY=/workspace/Developments/VoxCPM2/nanovllm-voxcpm/.venv/bin/python
+rm -f /tmp/bench_in && mkfifo /tmp/bench_in
+
+# Start daemon (reads cmds from /tmp/bench_in, writes JSON to /tmp/bench_out).
+# The `exec 9<>/tmp/bench_in` trick holds the fifo open so the daemon doesn't
+# exit on EOF between commands.
+(exec 9<>/tmp/bench_in;
+ MASTER_PORT=29800 UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+   $VPY voxcpm_fast/scripts/bench_daemon.py --fast <&9 > /tmp/bench_out 2>&1) &
+
+# Wait for "READY" (load_s ≈ 40-45 s on a 5090).
+until grep -q "^READY" /tmp/bench_out; do sleep 2; done
+```
+
+**Fire a bench** (one line, JSON, newline-terminated):
+```bash
+echo '{"cmd":"bench","tag":"baseline","target":"The quick brown fox jumps over the lazy dog.","trials":5}' \
+  > /tmp/bench_in
+# Result lands in /tmp/bench_out as a single `RESULT: {...}` line.
+```
+
+**Toggle env between trials without reloading** (checked at every forward):
+```bash
+echo '{"cmd":"env","set":{"VOXCPM_PREFETCH":"l2"}}' > /tmp/bench_in
+echo '{"cmd":"bench","tag":"prefetch=l2","trials":5}' > /tmp/bench_in
+
+echo '{"cmd":"env","set":{"VOXCPM_PREFETCH":"0"}}' > /tmp/bench_in
+echo '{"cmd":"bench","tag":"prefetch=off","trials":5}' > /tmp/bench_in
+```
+
+**Useful runtime-toggle env vars** (no reload needed; read per forward):
+- `VOXCPM_PREFETCH`       `l2 | 0`
+- `VOXCPM_GEMM`           `tuned | wmma`
+- `VOXCPM_PRE_ATTN`       `fused | (unset)`
+- `VOXCPM_ATTN`           `inline | (unset)`
+
+**Load-time env vars** (MUST be set before daemon start — read once by `fast_main_loop`):
+- `VOXCPM_FAST_ENC`, `VOXCPM_FAST_DIT`, `VOXCPM_FAST_BASE`, `VOXCPM_FAST_RES`
+
+**Register + bench a voice** (upstream caches VAE encoding by prompt_id):
+```bash
+echo '{"cmd":"bench","tag":"voice-bobby","voice":"bobby","target":"hello","trials":5}' > /tmp/bench_in
+```
+First invocation registers the voice (~5-8 s one-time); subsequent ones are instant.
+
+**Monitor the results stream** (Monitor tool — each `RESULT:` line is a single event):
+```
+tail -f /tmp/bench_out | grep -E --line-buffered "READY|RESULT|ERR|BYE|VOICE"
+```
+
+**Shut down:**
+```bash
+echo '{"cmd":"quit"}' > /tmp/bench_in
+```
+
+**When you DO need a full reload** (changing load-time env, changing kernel .so, changing `inference_timesteps`): stop the daemon, rebuild if needed, restart. But exhaust the hot-path A/Bs first.
+
+**Micro-benches that skip the whole engine** (<5 s each; use for kernel-only changes):
+- `voxcpm_fast/benchmarks/bench_gemm_only.py`          — GEMM primitives
+- `voxcpm_fast/benchmarks/bench_fused_layer_chained.py` — single-layer
+- `voxcpm_fast/benchmarks/bench_base_lm_graph.py`     — 28-layer chained
+
+Don't pay the 60 s engine-load tax if a 5 s micro-bench can validate your change.
+
 ---
 
 ## Orchestration protocol
