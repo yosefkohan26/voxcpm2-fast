@@ -142,16 +142,14 @@ class FusedCpm4ModelShim(torch.nn.Module):
         else:
             pos_flat = positions.to(torch.int32)
 
-        # Internal graph capture of the DiT sub-forward. When the outer
-        # stream is already capturing (i.e. the engine's prefill-graph
-        # capture is recording), the internal capture is deferred: we run
-        # the fused kernels eagerly on first invocation so the outer graph
-        # records them inline. When the outer stream is NOT capturing, we
-        # capture once per shape and replay on future calls. The "replay
-        # while outer is capturing" path (nested replay) is documented to
-        # work via cudaGraphAddChildGraphNode, but torch's CUDAGraph API
-        # doesn't expose it cleanly, so we stick to the inline-recording
-        # route for the outer graph.
+        # Internal graph capture of the DiT sub-forward. When outer
+        # stream is capturing (engine prefill graph), we must run fused
+        # kernels eagerly so the outer graph records them inline —
+        # PyTorch's CUDAGraph.replay() fails with "Cannot prepare for
+        # replay during capturing stage" when called under active outer
+        # capture. Nested replay via cudaGraphAddChildGraphNode is
+        # possible at the raw CUDA API level but not exposed through
+        # PyTorch's CUDAGraph object.
         outer_capturing = torch.cuda.is_current_stream_capturing()
         if (self._capture and input_embeds.is_cuda
                 and not torch.is_grad_enabled()
