@@ -31,6 +31,60 @@ Newest entries at the **top**. Never rewrite prior entries; if you need to retra
 
 ---
 
+### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2b.1: 5-phase cooperative megakernel (through O+residual)
+
+**Task:** P2.5.2 Step 2b.1 — extend the cooperative megakernel from 2 phases to 5, covering everything up through post-attention residual. Phase list: RMSNorm → QKV GEMM → RoPE → non-causal attention → O GEMM+residual. Remaining 4 phases (RMSNorm2 → gate_up GEMM → silu_mul → down GEMM+residual) land in Step 2b.2.
+
+**Files touched:**
+- `voxcpm_fast/megakernels/mk_dit_prefill.cu`:
+  - Refactored `vcpm_attention_noncausal_batched_kernel` body into a shared `mk_phase_attention_noncausal_tile<Q_BLOCK, K_BLOCK, D, NUM_Q, NUM_KV>` __device__ helper (takes explicit `q_tile, head_q, batch` args + SMEM pointer). The standalone Step 2a `__global__` kernel is now a thin wrapper that delegates.
+  - Added template parameter `HAS_RESIDUAL` to `mk_phase_gemm`. Fuses `C = A @ B^T + R` via the epilogue; R is bf16 [M, N] row-major.
+  - Added `mk_phase_rope` — LongRoPE in-place on the packed `[M, QKV_DIM]` qkv tensor, Q and K halves only. Warps-over-(token,head) with stride = `gridDim.x * 4`.
+  - Added `mk_phase_attention_noncausal_packed` — iterates `(q_tile, head_q, batch)` strided over blocks, computing Q/K/V pointers from the packed qkv base + offsets (`Q=qkv+0, K=qkv+Q_DIM, V=qkv+Q_DIM+KV_DIM`).
+  - Added `mk_dit_step2b1_kernel` (cooperative, 5 phases with `cg::this_grid().sync()` between) + launcher + `mk_dit_step2b1_partial_layer` Python wrapper + pybind `step2b1_partial_layer`.
+- `voxcpm_fast/tests/test_mk_dit_step2b1.py` — 2 numerics tests (DiT shape B=2 S=11 and larger B=4 S=32) vs a chained 5-phase reference built from `rmsnorm` + `gemm_bf16_tuned` + `rope_inplace` + `flash_attn_func(causal=False)` + `gemm_bf16_tuned_residual`.
+
+**Commands:**
+```bash
+PATH=/usr/local/cuda-12.8/bin:$PATH UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  MAX_JOBS=4 nanovllm-voxcpm/.venv/bin/python voxcpm_fast/csrc/setup.py build_ext --inplace
+
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/tests/test_mk_dit_step2b1.py
+
+# Regression: all prior tests
+for t in test_mk_dit_scaffold test_mk_dit_attn_noncausal test_mk_dit_step2b0; do
+  UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+    nanovllm-voxcpm/.venv/bin/python voxcpm_fast/tests/$t.py
+done
+```
+
+**Results:**
+
+Numerics vs chained 5-phase reference (real rows only; padded rows discarded):
+
+| shape | real_rows | max_abs | mae | max_val |
+|---|---|---|---|---|
+| DiT B=2 S=11 | 22 | **1.953e-03** | 4.074e-06 | 9.961e-01 |
+| Larger B=4 S=32 | 128 | **9.766e-04** | 3.021e-07 | 6.953e-01 |
+
+Both **≥ 5× under** the 1e-2 bf16 bar. Error comes from one extra bf16 round-trip relative to the chained form (attention output fp32→bf16 staged through SMEM vs chained's direct flash_attn bf16 output path); small and well-distributed (`mae ≪ max_abs`).
+
+Regression: scaffold + noncausal-attn + step2b0 all pass unchanged.
+
+**Architectural notes (important for Step 2b.2 and beyond):**
+- SMEM region (80 KB) is reused across all 5 phases via `extern __shared__ char[]`. Each phase casts it to its own layout: GEMM phases see `smem_A || smem_B || smem_C (fp32)`; attention phase sees `smem_q || smem_k || smem_v || smem_s (fp32) || smem_p (bf16) || smem_o (fp32) || smem_m || smem_l`. `cg::this_grid().sync()` acts as a full memory fence + block sync so SMEM re-aliasing at the top of each phase is safe.
+- Phase 4 (attention): block mapping is `(q_tile, head_q, batch)` packed into `blockIdx.x` with stride over `total = num_q_tiles * NUM_Q * B`. At DiT shape this is 32 blocks of the 64-block grid (other 32 idle). At larger B*S the stride path kicks in cleanly.
+- Phase 5 (O GEMM+residual): uses the HAS_RESIDUAL=true template path. Residual `hs` is passed as input (unmodified through phases 1-4); output `hs_out` is a separate tensor to avoid the megakernel reading/writing to the same tensor from different phases.
+- RoPE phase applies to only real rows (`N_real = B*S`), not the padded M. Padded-row qkv values remain zero (rmsnorm of zero-row = zero, GEMM of zero-row = zero), so not RoPE-ing them is correct and avoids reading `positions[N_real..M)` which may be padded with 0 but is irrelevant.
+
+**Dead ends:**
+- During the refactor I accidentally dropped `char* smem_ptr = smem_raw;` in the lifted helper (trying to remove old `// SMEM layout.` comment), causing `smem_ptr undefined` compile error. Fixed by restoring the local, caught by the build.
+
+**Next step:** **P2.5.2 Step 2b.2** — add the remaining 4 phases to close the full DiT layer: RMSNorm2 (uses the same `mk_phase_rmsnorm<1024, 128>` helper on `hs_out`), gate_up GEMM (M=64, N=8192, K=1024 via `mk_phase_gemm<64, 128, 32, 4, false>`), silu_mul (new helper, elementwise — simplest option is a separate phase; can try fused-into-down later), down GEMM+residual (M=64, N=1024, K=4096). Output: `layer_out = down_out + hs_out`. Numerics bar against chained `FusedLayer(causal=False, hidden=1024)` forward at DiT shape.
+
+---
+
 ### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2b.0: cooperative 2-phase megakernel (RMSNorm + QKV GEMM)
 
 **Task:** P2.5.2 Step 2b.0 — ship a cooperative-launch megakernel that runs TWO real compute phases (RMSNorm then tuned QKV GEMM) separated by `cg::this_grid().sync()`. Proves the plumbing for the full 9-phase DiT megakernel end-to-end before we commit to writing it.

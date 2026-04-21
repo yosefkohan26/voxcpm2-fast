@@ -160,17 +160,22 @@ torch::Tensor mk_dit_prefill_noop(int64_t num_blocks) {
 //   cudaFuncSetAttribute for this one.
 // =========================================================================
 
+// __device__ helper: compute ONE attention tile for (q_tile, head_q, batch).
+// Called from both the standalone kernel and the cooperative megakernel.
+// smem_raw is the full dynamic SMEM region (≥ the layout requirements below).
 template<int Q_BLOCK, int K_BLOCK, int D, int NUM_Q, int NUM_KV>
-__global__ void vcpm_attention_noncausal_batched_kernel(
+__device__ __forceinline__ void mk_phase_attention_noncausal_tile(
         const __nv_bfloat16* __restrict__ Q,
         int64_t q_b_stride, int64_t q_s_stride, int64_t q_h_stride,
         const __nv_bfloat16* __restrict__ K,
         int64_t k_b_stride, int64_t k_s_stride, int64_t k_h_stride,
         const __nv_bfloat16* __restrict__ V,
         int64_t v_b_stride, int64_t v_s_stride, int64_t v_h_stride,
-        __nv_bfloat16* __restrict__ O,        // [B, S, Hq*D] row-major contiguous
+        __nv_bfloat16* __restrict__ O,
         int o_b_stride, int o_s_stride,
-        float scale, int B, int S) {
+        float scale, int S,
+        int q_tile, int head_q, int batch,
+        char* smem_raw) {
     constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
     constexpr int WARPS = 4;
     constexpr int Q_PER_KV = NUM_Q / NUM_KV;  // 8
@@ -179,20 +184,11 @@ __global__ void vcpm_attention_noncausal_batched_kernel(
     static_assert(K_BLOCK % WMMA_N == 0, "K_BLOCK must be multiple of 16");
     static_assert(D % WMMA_K == 0,       "D must be multiple of 16");
 
-    int q_tile  = blockIdx.x;
-    int head_q  = blockIdx.y;
-    int batch   = blockIdx.z;
     int head_kv = head_q / Q_PER_KV;
     int q_base  = q_tile * Q_BLOCK;
 
     int tid     = threadIdx.x;
     int warp_id = tid >> 5;
-    int lane    = tid & 31;
-
-    // Early-exit: if this Q-tile is entirely beyond S, skip. (Still OK in
-    // cooperative-launch sense because we're not using coop here — this
-    // kernel is launched with plain <<<>>>.)
-    if (q_base >= S) return;
 
     // Base pointers into this (batch, head_q) / (batch, head_kv) slice.
     const __nv_bfloat16* Q_bh = Q + batch * q_b_stride + head_q  * q_h_stride;
@@ -200,8 +196,7 @@ __global__ void vcpm_attention_noncausal_batched_kernel(
     const __nv_bfloat16* V_bh = V + batch * v_b_stride + head_kv * v_h_stride;
     __nv_bfloat16*       O_bh = O + batch * o_b_stride + head_q  * D;
 
-    // SMEM layout.
-    extern __shared__ __align__(16) char smem_raw[];
+    // SMEM layout within the passed-in region.
     char* smem_ptr = smem_raw;
     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_ptr);
     smem_ptr += Q_BLOCK * D * sizeof(__nv_bfloat16);
@@ -401,6 +396,36 @@ __global__ void vcpm_attention_noncausal_batched_kernel(
         float val = (l_val > 0.f) ? (smem_o[i] / l_val) : 0.f;
         O_bh[n * o_s_stride + di] = __float2bfloat16(val);
     }
+}
+
+
+// Standalone __global__ that maps blockIdx → (q_tile, head_q, batch) and
+// delegates to the shared __device__ helper.
+template<int Q_BLOCK, int K_BLOCK, int D, int NUM_Q, int NUM_KV>
+__global__ void vcpm_attention_noncausal_batched_kernel(
+        const __nv_bfloat16* __restrict__ Q,
+        int64_t q_b_stride, int64_t q_s_stride, int64_t q_h_stride,
+        const __nv_bfloat16* __restrict__ K,
+        int64_t k_b_stride, int64_t k_s_stride, int64_t k_h_stride,
+        const __nv_bfloat16* __restrict__ V,
+        int64_t v_b_stride, int64_t v_s_stride, int64_t v_h_stride,
+        __nv_bfloat16* __restrict__ O,
+        int o_b_stride, int o_s_stride,
+        float scale, int B, int S) {
+    int q_tile = blockIdx.x;
+    int head_q = blockIdx.y;
+    int batch  = blockIdx.z;
+    // Early-exit for Q-tiles that are entirely beyond S.
+    if (q_tile * Q_BLOCK >= S) return;
+
+    extern __shared__ __align__(16) char smem_raw[];
+    mk_phase_attention_noncausal_tile<Q_BLOCK, K_BLOCK, D, NUM_Q, NUM_KV>(
+        Q, q_b_stride, q_s_stride, q_h_stride,
+        K, k_b_stride, k_s_stride, k_h_stride,
+        V, v_b_stride, v_s_stride, v_h_stride,
+        O, o_b_stride, o_s_stride,
+        scale, S, q_tile, head_q, batch,
+        smem_raw);
 }
 
 
@@ -632,11 +657,17 @@ __device__ __forceinline__ void mk_phase_rmsnorm(
 // Work-stealing over the total tile count so blocks can pick up multiple
 // tiles if tile_count > gridDim.x. smem_raw must be the full megakernel
 // SMEM region; the GEMM aliases it as A/B stages + C fp32 staging.
-template<int TM, int TN, int TK, int STAGES>
+//
+// HAS_RESIDUAL=true fuses a bf16 residual add into the epilogue:
+//   C[gr, gc] = A @ B^T [gr, gc] + R[gr, gc]
+// R must be [M, N] bf16 row-major (same layout as C). Used by the
+// o_proj and down_proj phases to fold residual_add into the GEMM.
+template<int TM, int TN, int TK, int STAGES, bool HAS_RESIDUAL>
 __device__ __forceinline__ void mk_phase_gemm(
         const __nv_bfloat16* __restrict__ A,  // [M, K]
         const __nv_bfloat16* __restrict__ B,  // [N, K]
         __nv_bfloat16* __restrict__ C,        // [M, N]
+        const __nv_bfloat16* __restrict__ R,  // [M, N] residual (nullable if !HAS_RESIDUAL)
         int M, int N, int K,
         char* smem_raw) {
     constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
@@ -737,7 +768,11 @@ __device__ __forceinline__ void mk_phase_gemm(
             int c = linear % TN;
             int gr = block_m + r;
             int gc = block_n + c;
-            C[gr * N + gc] = __float2bfloat16(smem_C[linear]);
+            float val = smem_C[linear];
+            if constexpr (HAS_RESIDUAL) {
+                val += __bfloat162float(R[gr * N + gc]);
+            }
+            C[gr * N + gc] = __float2bfloat16(val);
         }
         __syncthreads();  // before next tile reuses smem_C
     }
@@ -767,8 +802,8 @@ void mk_dit_step2b0_kernel(
 
     // Phase 2: qkv = ln_out @ w_qkv^T.
     // (TM=64, TN=128, TK=32, STAGES=4) identical to the chained tuned GEMM.
-    mk_phase_gemm<64, 128, 32, 4>(
-        scratch_a, w_qkv, scratch_b,
+    mk_phase_gemm<64, 128, 32, 4, false>(
+        scratch_a, w_qkv, scratch_b, nullptr,
         M, QKV_DIM, H, smem);
 }
 
@@ -886,6 +921,314 @@ std::tuple<torch::Tensor, torch::Tensor> mk_dit_step2b0_rmsnorm_qkv(
     return std::make_tuple(scratch_a, scratch_b);
 }
 
+
+// =========================================================================
+// Step 2b.1 — extend megakernel with RoPE + non-causal attn + O GEMM+residual.
+//
+// Phases (5 of 9; Step 2b.2 will add the remaining 4):
+//   1. ln_out   = RMSNorm(hs, w_in_ln)         [M, 1024]
+//   2. qkv      = ln_out @ w_qkv^T              [M, 2560]
+//   3. RoPE in-place on qkv (Q and K halves)    [M, 2560]
+//   4. attn_out = noncausal_attention(qkv)      [M, 2048]  (N_real = B*S rows)
+//   5. hs_out   = attn_out @ w_o^T + hs         [M, 1024]  (residual-fused)
+//
+// Output: hs_out (the post-attention residual). The caller passes this
+// back in for Step 2b.2 (RMSNorm2 → gate_up → silu → down → residual).
+//
+// Attention mapping: block idx → (q_tile, head_q, batch). At DiT shape
+// (B=2, S=11) total work = num_q_tiles × NUM_Q × B = 1 × 16 × 2 = 32
+// blocks. With grid=64 we stride: for blk = blockIdx.x; blk < total;
+// blk += gridDim.x.
+//
+// SMEM remains 80 KB (GEMM-sized); attention needs only ~30 KB and aliases
+// the same region.
+// =========================================================================
+
+// RoPE phase: applies LongRoPE to Q and K slices of the packed [M, QKV_DIM]
+// tensor in-place. Each warp handles one (token, head) pair; strided over
+// (blockIdx.x * WARPS_PER_BLOCK + warp_id) so multiple blocks split the
+// total_warps space evenly.
+__device__ __forceinline__ void mk_phase_rope(
+        __nv_bfloat16* __restrict__ qkv,
+        const float*    __restrict__ cos_cache,
+        const float*    __restrict__ sin_cache,
+        const int32_t*  __restrict__ positions,
+        int N_real,                              // only real rows get RoPE'd
+        int num_heads, int num_kv_heads, int head_dim,
+        int q_dim, int kv_dim, int qkv_dim) {
+    constexpr int WARPS_PER_BLOCK = 4;
+    int tid  = threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int warp_id_global = blockIdx.x * WARPS_PER_BLOCK + warp;
+    int warp_stride    = gridDim.x * WARPS_PER_BLOCK;
+
+    int heads_per_token = num_heads + num_kv_heads;
+    int total_warps = N_real * heads_per_token;
+
+    for (int w = warp_id_global; w < total_warps; w += warp_stride) {
+        int tok = w / heads_per_token;
+        int head_in_tok = w % heads_per_token;
+        int pos = positions[tok];
+        const float* cos_row = cos_cache + pos * head_dim;
+        const float* sin_row = sin_cache + pos * head_dim;
+
+        __nv_bfloat16* base;
+        if (head_in_tok < num_heads) {
+            int h = head_in_tok;
+            base = qkv + tok * qkv_dim + h * head_dim;
+        } else {
+            int h = head_in_tok - num_heads;
+            base = qkv + tok * qkv_dim + q_dim + h * head_dim;
+        }
+
+        int half = head_dim / 2;
+        constexpr int MAX_PAIRS_PER_LANE = 4;  // head_dim <= 256
+        float x_lo[MAX_PAIRS_PER_LANE];
+        float x_hi[MAX_PAIRS_PER_LANE];
+        int   lo_idx[MAX_PAIRS_PER_LANE];
+        int n_pairs = 0;
+        for (int p = lane; p < half; p += 32) {
+            x_lo[n_pairs] = __bfloat162float(base[p]);
+            x_hi[n_pairs] = __bfloat162float(base[p + half]);
+            lo_idx[n_pairs] = p;
+            n_pairs++;
+        }
+        for (int i = 0; i < n_pairs; ++i) {
+            int lo = lo_idx[i];
+            int hi = lo + half;
+            float c_lo = cos_row[lo];
+            float s_lo = sin_row[lo];
+            float c_hi = cos_row[hi];
+            float s_hi = sin_row[hi];
+            float y_lo = x_lo[i] * c_lo + (-x_hi[i]) * s_lo;
+            float y_hi = x_hi[i] * c_hi + ( x_lo[i]) * s_hi;
+            base[lo] = __float2bfloat16(y_lo);
+            base[hi] = __float2bfloat16(y_hi);
+        }
+    }
+}
+
+
+// Attention phase: iterates over all (q_tile, head_q, batch) triples in a
+// strided fashion, calling the shared __device__ helper per triple. Q/K/V
+// are derived from the packed qkv tensor via offsets:
+//     Q = qkv + 0
+//     K = qkv + q_dim
+//     V = qkv + q_dim + kv_dim
+// all with row stride = qkv_dim.
+template<int Q_BLOCK, int K_BLOCK, int D, int NUM_Q, int NUM_KV>
+__device__ __forceinline__ void mk_phase_attention_noncausal_packed(
+        const __nv_bfloat16* __restrict__ qkv,   // [B*S, qkv_dim] packed
+        __nv_bfloat16* __restrict__ O,           // [B, S, Hq, D] contiguous
+        int B, int S,
+        int q_dim, int kv_dim, int qkv_dim,
+        float scale,
+        char* smem_raw) {
+    int num_q_tiles = (S + Q_BLOCK - 1) / Q_BLOCK;
+    int total = num_q_tiles * NUM_Q * B;
+
+    // Strides: qkv is [B*S, qkv_dim]; view as [B, S, Hq_stride/D, D] with
+    // q_b_stride=S*qkv_dim, q_s_stride=qkv_dim, q_h_stride=D.
+    int64_t q_b = (int64_t)S * qkv_dim;
+    int64_t q_s = qkv_dim;
+    int64_t q_h = D;
+    // K starts at offset q_dim; same strides.
+    const __nv_bfloat16* K_base = qkv + q_dim;
+    const __nv_bfloat16* V_base = qkv + q_dim + kv_dim;
+
+    int o_b = S * NUM_Q * D;
+    int o_s = NUM_Q * D;
+
+    for (int blk = blockIdx.x; blk < total; blk += gridDim.x) {
+        int q_tile = blk % num_q_tiles;
+        int rem    = blk / num_q_tiles;
+        int head_q = rem % NUM_Q;
+        int batch  = rem / NUM_Q;
+
+        mk_phase_attention_noncausal_tile<Q_BLOCK, K_BLOCK, D, NUM_Q, NUM_KV>(
+            qkv,    q_b, q_s, q_h,
+            K_base, q_b, q_s, q_h,
+            V_base, q_b, q_s, q_h,
+            O, o_b, o_s,
+            scale, S, q_tile, head_q, batch,
+            smem_raw);
+
+        // Block-wide sync between attention tiles so the SMEM region is
+        // safe to reuse for the next (q_tile, head_q, batch).
+        __syncthreads();
+    }
+}
+
+
+// ---- Step 2b.1 megakernel: 5 phases (rmsnorm → qkv → rope → attn → o+resid) ----
+extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 2)
+void mk_dit_step2b1_kernel(
+        const __nv_bfloat16* __restrict__ hs,        // [M, H=1024] input residual
+        __nv_bfloat16*       __restrict__ hs_out,    // [M, H] post-attention residual
+        const __nv_bfloat16* __restrict__ w_in_ln,   // [H]
+        const __nv_bfloat16* __restrict__ w_qkv,     // [QKV_DIM, H]
+        const __nv_bfloat16* __restrict__ w_o,       // [H, Q_DIM]
+        const float*         __restrict__ cos_cache,
+        const float*         __restrict__ sin_cache,
+        const int32_t*       __restrict__ positions,
+        __nv_bfloat16*       __restrict__ scratch_a, // [M, max(H, Q_DIM)=2048]
+        __nv_bfloat16*       __restrict__ scratch_b, // [M, QKV_DIM=2560]
+        int M, int B, int S,                         // N_real = B*S
+        float rms_eps, float attn_scale) {
+    cg::grid_group grid = cg::this_grid();
+    extern __shared__ __align__(16) char smem[];
+
+    constexpr int H       = 1024;
+    constexpr int QKV_DIM = 2560;
+    constexpr int Q_DIM   = 2048;
+    constexpr int KV_DIM  = 256;
+
+    // Phase 1: ln_out = RMSNorm(hs, w_in_ln) → scratch_a[:, :H]
+    mk_phase_rmsnorm<H, MK_COOP_BLOCK>(hs, w_in_ln, scratch_a, M, rms_eps);
+    grid.sync();
+
+    // Phase 2: qkv = ln_out @ w_qkv^T → scratch_b
+    mk_phase_gemm<64, 128, 32, 4, false>(
+        scratch_a, w_qkv, scratch_b, nullptr, M, QKV_DIM, H, smem);
+    grid.sync();
+
+    // Phase 3: RoPE in-place on scratch_b's Q and K halves (only real rows).
+    int N_real = B * S;
+    mk_phase_rope(scratch_b, cos_cache, sin_cache, positions,
+                  N_real, 16, 2, 128, Q_DIM, KV_DIM, QKV_DIM);
+    grid.sync();
+
+    // Phase 4: attn_out = NonCausalAttention(qkv) → scratch_a[:, :Q_DIM]
+    // scratch_a must be capacity [M, Q_DIM]; caller sizes scratch_a to max(H, Q_DIM).
+    mk_phase_attention_noncausal_packed<16, 32, 128, 16, 2>(
+        scratch_b, scratch_a, B, S, Q_DIM, KV_DIM, QKV_DIM, attn_scale, smem);
+    grid.sync();
+
+    // Phase 5: hs_out = attn_out @ w_o^T + hs (residual-fused GEMM)
+    mk_phase_gemm<64, 128, 32, 4, true>(
+        scratch_a, w_o, hs_out, hs, M, H, Q_DIM, smem);
+}
+
+
+static void mk_dit_step2b1_launch(
+        const torch::Tensor& hs,
+        torch::Tensor& hs_out,
+        const torch::Tensor& w_in_ln,
+        const torch::Tensor& w_qkv,
+        const torch::Tensor& w_o,
+        const torch::Tensor& cos_cache,
+        const torch::Tensor& sin_cache,
+        const torch::Tensor& positions,
+        torch::Tensor& scratch_a,
+        torch::Tensor& scratch_b,
+        int B, int S,
+        double rms_eps, double attn_scale) {
+    TORCH_CHECK(hs.is_cuda() && hs.dtype() == torch::kBFloat16 && hs.is_contiguous()
+                && hs.dim() == 2 && hs.size(1) == 1024, "hs [M,1024] bf16");
+    TORCH_CHECK(hs_out.is_cuda() && hs_out.dtype() == torch::kBFloat16
+                && hs_out.is_contiguous() && hs_out.sizes() == hs.sizes(),
+                "hs_out sizes must match hs");
+    int M = (int)hs.size(0);
+    TORCH_CHECK(M % 64 == 0, "M must be padded to multiple of 64");
+    TORCH_CHECK(M >= B * S, "M must be >= B*S");
+    TORCH_CHECK(w_in_ln.is_cuda() && w_in_ln.numel() == 1024, "w_in_ln [1024]");
+    TORCH_CHECK(w_qkv.is_cuda() && w_qkv.dim() == 2
+                && w_qkv.size(0) == 2560 && w_qkv.size(1) == 1024, "w_qkv [2560,1024]");
+    TORCH_CHECK(w_o.is_cuda() && w_o.dim() == 2
+                && w_o.size(0) == 1024 && w_o.size(1) == 2048, "w_o [1024,2048]");
+    TORCH_CHECK(cos_cache.dtype() == torch::kFloat32 && sin_cache.dtype() == torch::kFloat32,
+                "cos/sin fp32");
+    TORCH_CHECK(positions.dtype() == torch::kInt32 && positions.numel() >= B * S,
+                "positions int32 [>=B*S]");
+    TORCH_CHECK(scratch_a.is_cuda() && scratch_a.dtype() == torch::kBFloat16
+                && scratch_a.is_contiguous() && scratch_a.dim() == 2
+                && scratch_a.size(0) == M && scratch_a.size(1) >= 2048,
+                "scratch_a [M, >=2048]");
+    TORCH_CHECK(scratch_b.is_cuda() && scratch_b.dtype() == torch::kBFloat16
+                && scratch_b.is_contiguous() && scratch_b.dim() == 2
+                && scratch_b.size(0) == M && scratch_b.size(1) == 2560,
+                "scratch_b [M,2560]");
+
+    constexpr int TM = 64, TN = 128, TK = 32, STAGES = 4;
+    size_t smem_bytes =
+          STAGES * TM * TK * sizeof(__nv_bfloat16)
+        + STAGES * TN * TK * sizeof(__nv_bfloat16)
+        + TM * TN * sizeof(float);
+
+    cudaFuncSetAttribute(
+        mk_dit_step2b1_kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+
+    int device = 0;
+    cudaGetDevice(&device);
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+    int blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, (const void*)mk_dit_step2b1_kernel,
+        MK_COOP_BLOCK, smem_bytes);
+    int64_t max_concurrent = (int64_t)sm_count * blocks_per_sm;
+    TORCH_CHECK(MK_COOP_GRID <= max_concurrent,
+                "cooperative limit exceeded: grid=", (int)MK_COOP_GRID,
+                " > sm(", sm_count, ")*per_sm(", blocks_per_sm, ")=", max_concurrent);
+
+    const __nv_bfloat16* hs_p   = reinterpret_cast<const __nv_bfloat16*>(hs.data_ptr());
+    __nv_bfloat16*       ho_p   = reinterpret_cast<__nv_bfloat16*>(hs_out.data_ptr());
+    const __nv_bfloat16* wl_p   = reinterpret_cast<const __nv_bfloat16*>(w_in_ln.data_ptr());
+    const __nv_bfloat16* wq_p   = reinterpret_cast<const __nv_bfloat16*>(w_qkv.data_ptr());
+    const __nv_bfloat16* wo_p   = reinterpret_cast<const __nv_bfloat16*>(w_o.data_ptr());
+    const float*         cos_p  = cos_cache.data_ptr<float>();
+    const float*         sin_p  = sin_cache.data_ptr<float>();
+    const int32_t*       pos_p  = positions.data_ptr<int32_t>();
+    __nv_bfloat16*       sa_p   = reinterpret_cast<__nv_bfloat16*>(scratch_a.data_ptr());
+    __nv_bfloat16*       sb_p   = reinterpret_cast<__nv_bfloat16*>(scratch_b.data_ptr());
+    float                eps_f  = (float)rms_eps;
+    float                scl_f  = (float)attn_scale;
+
+    void* args[] = {
+        (void*)&hs_p, (void*)&ho_p,
+        (void*)&wl_p, (void*)&wq_p, (void*)&wo_p,
+        (void*)&cos_p, (void*)&sin_p, (void*)&pos_p,
+        (void*)&sa_p, (void*)&sb_p,
+        (void*)&M, (void*)&B, (void*)&S,
+        (void*)&eps_f, (void*)&scl_f,
+    };
+
+    dim3 grid(MK_COOP_GRID);
+    dim3 block(MK_COOP_BLOCK);
+    auto stream = at::cuda::getCurrentCUDAStream();
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        (const void*)mk_dit_step2b1_kernel,
+        grid, block, args, smem_bytes, stream.stream());
+    TORCH_CHECK(err == cudaSuccess, "cudaLaunchCooperativeKernel failed: ",
+                cudaGetErrorString(err));
+}
+
+
+// Python-facing wrapper. Returns the post-attention residual (hs_out).
+torch::Tensor mk_dit_step2b1_partial_layer(
+        const torch::Tensor& hs,
+        const torch::Tensor& w_in_ln,
+        const torch::Tensor& w_qkv,
+        const torch::Tensor& w_o,
+        const torch::Tensor& cos_cache,
+        const torch::Tensor& sin_cache,
+        const torch::Tensor& positions,
+        int64_t B, int64_t S,
+        double rms_eps, double attn_scale) {
+    int M = (int)hs.size(0);
+    auto opts = hs.options();
+    auto hs_out    = torch::empty({M, 1024},       opts);
+    auto scratch_a = torch::empty({M, 2048},       opts);  // sized for attn_out
+    auto scratch_b = torch::empty({M, 2560},       opts);
+    mk_dit_step2b1_launch(hs, hs_out, w_in_ln, w_qkv, w_o,
+                          cos_cache, sin_cache, positions,
+                          scratch_a, scratch_b,
+                          (int)B, (int)S, rms_eps, attn_scale);
+    return hs_out;
+}
+
 }  // namespace voxcpm_fast
 
 
@@ -920,4 +1263,23 @@ PYBIND11_MODULE(mk_dit_prefill_ext, m) {
           pybind11::arg("w_in_ln"),
           pybind11::arg("w_qkv"),
           pybind11::arg("rms_eps") = 1e-6);
+
+    m.def("step2b1_partial_layer",
+          &voxcpm_fast::mk_dit_step2b1_partial_layer,
+          "P2.5.2 Step 2b.1: cooperative 5-phase megakernel — "
+          "RMSNorm + QKV GEMM + RoPE + non-causal attention + O GEMM+residual. "
+          "Returns hs_out = attn_out @ w_o^T + hs (post-attention residual). "
+          "Caller pre-pads M to 64; positions must also be padded. "
+          "B and S are the batch and real-sequence dims (N_real = B*S ≤ M).",
+          pybind11::arg("hs"),
+          pybind11::arg("w_in_ln"),
+          pybind11::arg("w_qkv"),
+          pybind11::arg("w_o"),
+          pybind11::arg("cos_cache"),
+          pybind11::arg("sin_cache"),
+          pybind11::arg("positions"),
+          pybind11::arg("B"),
+          pybind11::arg("S"),
+          pybind11::arg("rms_eps") = 1e-6,
+          pybind11::arg("attn_scale"));
 }
