@@ -31,6 +31,72 @@ Newest entries at the **top**. Never rewrite prior entries; if you need to retra
 
 ---
 
+### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2a: non-causal batched attention kernel
+
+**Task:** P2.5.2 Step 2a — ship the non-causal batched attention primitive that the future DiT megakernel (Steps 2b–4) will call as a __device__ sub-phase. Standalone first so we can numerics-validate in isolation before the cooperative-kernel complexity.
+
+**Files touched:**
+- `voxcpm_fast/megakernels/mk_dit_prefill.cu` — added `vcpm_attention_noncausal_batched_kernel<Q_BLOCK=16, K_BLOCK=32, D=128, NUM_Q=16, NUM_KV=2>` + `torch::Tensor vcpm_attention_noncausal_batched(...)` launcher + pybind binding `attention_noncausal_batched`.
+- `voxcpm_fast/tests/test_mk_dit_attn_noncausal.py` — 5 numerics tests (contig, as_strided, long_seq, tiny_seq, multi_batch).
+- `voxcpm_fast/benchmarks/bench_mk_dit_attn.py` — standalone perf probe vs flash_attn.
+
+**Algorithm:** flash-attention-2 style with online softmax. Block = (q_tile, head_q, batch). 4 warps per block: 2 active for QK^T (Q_BLOCK=16, K_BLOCK=32 → 2 N-tiles), all 4 for PV (4 N-strips of 32 cols each). Per-batch Q/K/V base pointers enforce cross-batch isolation (Q in batch b only attends to K/V in batch b). K-padding masked to -INF. SMEM budget ~30 KB (under the 48 KB carveout, no `cudaFuncSetAttribute` needed).
+
+**Commands:**
+```bash
+# Build
+PATH=/usr/local/cuda-12.8/bin:$PATH UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  MAX_JOBS=4 nanovllm-voxcpm/.venv/bin/python voxcpm_fast/csrc/setup.py build_ext --inplace
+
+# Numerics
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/tests/test_mk_dit_attn_noncausal.py
+
+# Perf
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/benchmarks/bench_mk_dit_attn.py
+```
+
+**Results:**
+
+Numerics (vs flash_attn_func(..., causal=False)):
+
+| test | B | S | max_abs | mae | status |
+|---|---|---|---|---|---|
+| dit_shape_contig | 2 | 11 | **0.000e+00** | 0.000e+00 | bit-exact |
+| dit_shape_strided | 2 | 11 | **0.000e+00** | 0.000e+00 | bit-exact (as_strided views on packed qkv — the real stride pattern the layer wrapper uses) |
+| long_seq | 1 | 100 | 2.441e-04 | 9.551e-06 | 40× under 1e-2 bar |
+| tiny_seq | 4 | 3 | 0.000e+00 | 0.000e+00 | bit-exact |
+| multi_batch | 8 | 16 | 6.104e-05 | 4.075e-10 | cross-batch isolation verified |
+
+All 5 tests PASS the bf16 bar (≤ 1e-2 max-abs) with enormous margin.
+
+Standalone perf @ DiT shape B=2, S=11:
+
+| kernel | p50 | p95 | p99 | (µs) |
+|---|---|---|---|---|
+| flash_attn causal=False | 112.7 | 243.7 | 258.2 | ref |
+| ours noncausal_batched | **14.8** | 18.7 | 22.3 | **7.59×** |
+
+At this shape M=22 is too small for flash_attn to amortize its launch+dispatch cost — our specialized kernel wins standalone. This is the same pattern we saw for `vcpm_attention_causal` (2.42× standalone, lost when integrated via chained form). **The real win arrives after Step 2b when this becomes a __device__ phase inside a cooperative kernel, eliminating the flash_attn launch overhead entirely.**
+
+**Dead ends:**
+- none — first attempt passed numerics cleanly.
+
+**Next step:** **P2.5.2 Step 2b** — fused single-DiT-layer cooperative megakernel. Assemble RMSNorm → GEMM (qkv) → RoPE → the new `attention_noncausal_batched` phase → GEMM+residual (o_proj) → RMSNorm → GEMM (gate_up) → fused silu_mul+GEMM+residual (down_proj) inside one `cudaLaunchCooperativeKernel` with `cg::this_grid().sync()` between phases. Target: numerics parity with chained `FusedLayer` at DiT shape, single kernel launch per layer.
+
+**Hand-off notes for Step 2b:**
+- SMEM phase budgets (reuse the same region via `extern __shared__`):
+  - GEMM tile (TM=64, TN=128, TK=32, STAGES=4): ~80 KB — dominant, requires `cudaFuncSetAttribute(MaxDynamicSharedMemorySize, 82000)`.
+  - Attention (this step): ~30 KB.
+  - RMSNorm: ~512 B reduction buffer.
+- Cooperative-launch block count: pick `grid_size = max(gate_up_grid) = 64` (gate_up has the most tiles). Phases with fewer tiles idle those CTAs at the phase's grid.sync.
+- Cannot span `ExistingKernel1(..); grid.sync; ExistingKernel2(..)` — each phase needs a __device__ function callable from within the megakernel. Lift the bodies of `vcpm_rmsnorm_kernel`, `vcpm_gemm_bf16_tuned_kernel`, `vcpm_rope_kernel`, THIS kernel, `vcpm_silu_mul_kernel` into __device__ helpers that take (blockIdx, threadIdx) arguments explicitly.
+- Weights layout: pass all 6 weight pointers (`w_in_ln`, `w_qkv`, `w_o`, `w_post_ln`, `w_gu`, `w_dn`) + 2 rope caches + scratch buffer. Scratch needs to be max(2560*64, 8192*64) bf16 = 1 MB HBM per layer (small).
+- Build validation against `FusedLayer(hidden=1024, intermediate=4096, causal=False)` using layer-0 DiT weights (see `bench_dit_layer.py` for the setup pattern).
+
+---
+
 ### 2026-04-21 — orchestrator (hands-on) — Engine wiring finalization: T_first 194 → 25 ms stable
 
 **Addendum to earlier entry below.** After the initial 28 ms milestone, a few more iterations landed the final integration state:
