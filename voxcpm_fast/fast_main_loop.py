@@ -32,11 +32,18 @@ def fast_main_loop(queue_in, queue_out, args, kwargs):
     enc = os.environ.get("VOXCPM_FAST_ENC", "1") != "0"
     dit = os.environ.get("VOXCPM_FAST_DIT", "1") != "0"
     # base_lm + residual_lm swap: currently net-negative at small N because
-    # the store_kvcache launch overhead + per-GEMM pad allocation outweighs
-    # our GEMM savings. Keep the code in place (works end-to-end) but disable
-    # by default. Re-evaluate when we test longer prompts.
+    # the tuned GEMM (TM=64) forces M=16→64 padding, computing 4× waste per
+    # GEMM; at bucket=16 that's ≈+1 ms over upstream's small-M cuBLAS call.
+    # Keep the code in place (works end-to-end) but disable by default.
+    # Re-evaluate once we ship a smaller-tile (TM=16 or TM=32) GEMM variant
+    # or once we bucket up to N≥64 where padding cost disappears.
     base = os.environ.get("VOXCPM_FAST_BASE", "0") != "0"
     res = os.environ.get("VOXCPM_FAST_RES", "0") != "0"
+
+    # L2 prefetch of next-layer weights via a side-stream _ext.l2_warm.
+    # Measured +1.4 ms T_first win at bucket=16 (23.5 vs 24.9). Enabled by
+    # default; set VOXCPM_PREFETCH=0 to disable for A/B.
+    os.environ.setdefault("VOXCPM_PREFETCH", "l2")
 
     from voxcpm_fast.engine_hook import (
         install_fast_path, install_prefill_graph_capture, install_timing_probe,

@@ -421,10 +421,14 @@ class FusedCpm4Model:
         # Batched attention (bsz>1) would also cross-pollute batches with junk.
         # In both unsafe cases, rely on per-GEMM padding inside `_gemm*`.
         causal_any = any(l.causal for l in self.layers)
-        # Skip model-level padding when a caller provides KV caches — the
-        # slot_mapping they pass in is sized N_real, and store_kvcache would
-        # assert N_real != N_padded inside the layer.
-        if batch_size == 1 and causal_any and kv_caches is None:
+        # Model-level padding once per forward (vs per-GEMM internal padding).
+        # Safe when attention is causal AND batch_size==1. For the KV-cache
+        # path, we extend slot_mapping with -1 for padded rows so
+        # store_kvcache skips them (upstream's triton kernel treats slot=-1
+        # as a no-op). Non-causal or batched paths still fall through to
+        # per-GEMM padding because their attention can't tolerate junk rows.
+        slot_padded = slot_mapping
+        if batch_size == 1 and causal_any:
             hs, pad = _pad_M_to(input_embeds.contiguous(), 64)
         else:
             hs, pad = input_embeds.contiguous(), 0
@@ -433,6 +437,13 @@ class FusedCpm4Model:
             # Fill padded position slots with the last real position.
             pos = torch.cat([positions, positions[-1:].expand(pad).contiguous()])
             pos = pos.contiguous()
+            if slot_mapping is not None:
+                # Extend slot_mapping with -1 sentinels for padded rows.
+                slot_padded = torch.cat([
+                    slot_mapping,
+                    torch.full((pad,), -1, dtype=slot_mapping.dtype,
+                               device=slot_mapping.device),
+                ]).contiguous()
 
         prefetch = os.environ.get("VOXCPM_PREFETCH") == "l2"
         side = None
@@ -450,7 +461,7 @@ class FusedCpm4Model:
                 kc, vc = kv_caches[i]
                 hs = layer.forward(hs, pos, batch_size=batch_size,
                                    k_cache=kc, v_cache=vc,
-                                   slot_mapping=slot_mapping)
+                                   slot_mapping=slot_padded)
             else:
                 hs = layer.forward(hs, pos, batch_size=batch_size)
 
