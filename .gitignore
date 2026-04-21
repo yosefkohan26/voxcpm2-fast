@@ -16,6 +16,6 @@ voxcpm_fast/build/
 *.pth
 *.safetensors
 
-# nanovllm-voxcpm is an upstream clone; track the pyproject change we need, skip the rest
-nanovllm-voxcpm/.venv/
-nanovllm-voxcpm/uv.lock
+# nanovllm-voxcpm is an upstream clone; only pyproject.toml is tracked
+nanovllm-voxcpm/*
+!nanovllm-voxcpm/pyproject.toml
