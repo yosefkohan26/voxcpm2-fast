@@ -530,8 +530,13 @@ torch::Tensor vcpm_attention_noncausal_batched(
 // cudaFuncSetAttribute(MaxDynamicSharedMemorySize) at setup.
 // =========================================================================
 
-static constexpr int MK_COOP_GRID = 64;      // fixed for Step 2b.x
-static constexpr int MK_COOP_BLOCK = 128;    // 4 warps
+// Grid sized for gate_up GEMM at TN=32 = 256 tiles. At 32 KB SMEM/block on
+// sm_120a this fits 2 blocks/SM × 128 SMs = 256 resident. The __launch_bounds__
+// hint (128, 4) asks the compiler to target 4 blocks/SM register budget so
+// the lighter phases (RMSNorm, RoPE, silu_mul, attention) get higher
+// occupancy when the GEMM SMEM pressure isn't active.
+static constexpr int MK_COOP_GRID = 256;
+static constexpr int MK_COOP_BLOCK = 128;
 
 // ---- SMEM helpers (duplicated from fused_layer_chained.cu intentionally
 // so this translation unit is self-contained; the helpers are ~30 lines
@@ -783,7 +788,7 @@ __device__ __forceinline__ void mk_phase_gemm(
 //
 // Shapes locked to DiT layer: H=1024, QKV_DIM=2560. M and K_gemm passed in
 // so the same kernel works for base_lm (H=2048) later.
-extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 2)
+extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 4)
 void mk_dit_step2b0_kernel(
         const __nv_bfloat16* __restrict__ hs,        // [M, H]
         const __nv_bfloat16* __restrict__ w_in_ln,   // [H]
@@ -802,7 +807,7 @@ void mk_dit_step2b0_kernel(
 
     // Phase 2: qkv = ln_out @ w_qkv^T.
     // (TM=64, TN=128, TK=32, STAGES=4) identical to the chained tuned GEMM.
-    mk_phase_gemm<64, 128, 32, 4, false>(
+    mk_phase_gemm<64, 32, 32, 4, false>(
         scratch_a, w_qkv, scratch_b, nullptr,
         M, QKV_DIM, H, smem);
 }
@@ -845,7 +850,7 @@ static void mk_dit_step2b0_launch(
     // SMEM sizing: driven by the GEMM (RMSNorm's tiny reduction buffer is a
     // static __shared__ inside the __device__ function, not counted in
     // dynamic SMEM).
-    constexpr int TM = 64, TN = 128, TK = 32, STAGES = 4;
+    constexpr int TM = 64, TN = 32, TK = 32, STAGES = 4;
     size_t smem_bytes =
           STAGES * TM * TK * sizeof(__nv_bfloat16)
         + STAGES * TN * TK * sizeof(__nv_bfloat16)
@@ -1062,7 +1067,7 @@ __device__ __forceinline__ void mk_phase_attention_noncausal_packed(
 
 
 // ---- Step 2b.1 megakernel: 5 phases (rmsnorm → qkv → rope → attn → o+resid) ----
-extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 2)
+extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 4)
 void mk_dit_step2b1_kernel(
         const __nv_bfloat16* __restrict__ hs,        // [M, H=1024] input residual
         __nv_bfloat16*       __restrict__ hs_out,    // [M, H] post-attention residual
@@ -1089,7 +1094,7 @@ void mk_dit_step2b1_kernel(
     grid.sync();
 
     // Phase 2: qkv = ln_out @ w_qkv^T → scratch_b
-    mk_phase_gemm<64, 128, 32, 4, false>(
+    mk_phase_gemm<64, 32, 32, 4, false>(
         scratch_a, w_qkv, scratch_b, nullptr, M, QKV_DIM, H, smem);
     grid.sync();
 
@@ -1106,7 +1111,7 @@ void mk_dit_step2b1_kernel(
     grid.sync();
 
     // Phase 5: hs_out = attn_out @ w_o^T + hs (residual-fused GEMM)
-    mk_phase_gemm<64, 128, 32, 4, true>(
+    mk_phase_gemm<64, 32, 32, 4, true>(
         scratch_a, w_o, hs_out, hs, M, H, Q_DIM, smem);
 }
 
@@ -1150,7 +1155,7 @@ static void mk_dit_step2b1_launch(
                 && scratch_b.size(0) == M && scratch_b.size(1) == 2560,
                 "scratch_b [M,2560]");
 
-    constexpr int TM = 64, TN = 128, TK = 32, STAGES = 4;
+    constexpr int TM = 64, TN = 32, TK = 32, STAGES = 4;
     size_t smem_bytes =
           STAGES * TM * TK * sizeof(__nv_bfloat16)
         + STAGES * TN * TK * sizeof(__nv_bfloat16)
@@ -1255,7 +1260,7 @@ __device__ __forceinline__ void mk_phase_silu_mul(
 // fraction of the grid is needed: rmsnorm/rmsnorm2 use all 64 (rows);
 // qkv GEMM 20 tiles; attention 32; o GEMM 8; gate_up GEMM 64; silu all
 // 64; down GEMM 8. Idle blocks skip the phase loop and hit grid.sync.
-extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 2)
+extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 4)
 void mk_dit_step2b2_kernel(
         const __nv_bfloat16* __restrict__ hs,           // [M, 1024] input
         __nv_bfloat16*       __restrict__ layer_out,    // [M, 1024] final output
@@ -1290,7 +1295,7 @@ void mk_dit_step2b2_kernel(
     grid.sync();
 
     // Phase 2: qkv = ln_out @ w_qkv^T → scratch_qkv
-    mk_phase_gemm<64, 128, 32, 4, false>(
+    mk_phase_gemm<64, 32, 32, 4, false>(
         scratch_ln, w_qkv, scratch_qkv, nullptr, M, QKV_DIM, H, smem);
     grid.sync();
 
@@ -1306,7 +1311,7 @@ void mk_dit_step2b2_kernel(
     grid.sync();
 
     // Phase 5: hs_attn = attn_out @ w_o^T + hs → scratch_hs_attn
-    mk_phase_gemm<64, 128, 32, 4, true>(
+    mk_phase_gemm<64, 32, 32, 4, true>(
         scratch_attn, w_o, scratch_hs_attn, hs, M, H, Q_DIM, smem);
     grid.sync();
 
@@ -1315,7 +1320,7 @@ void mk_dit_step2b2_kernel(
     grid.sync();
 
     // Phase 7: gu = ln2_out @ w_gu^T → scratch_gu
-    mk_phase_gemm<64, 128, 32, 4, false>(
+    mk_phase_gemm<64, 32, 32, 4, false>(
         scratch_ln, w_gu, scratch_gu, nullptr, M, 2 * INTER, H, smem);
     grid.sync();
 
@@ -1324,7 +1329,7 @@ void mk_dit_step2b2_kernel(
     grid.sync();
 
     // Phase 9: layer_out = mid @ w_dn^T + hs_attn → layer_out (residual-fused)
-    mk_phase_gemm<64, 128, 32, 4, true>(
+    mk_phase_gemm<64, 32, 32, 4, true>(
         scratch_mid, w_dn, layer_out, scratch_hs_attn, M, H, INTER, smem);
 }
 
@@ -1351,7 +1356,7 @@ static void mk_dit_step2b2_launch(
         double rms_eps, double attn_scale) {
     int M = (int)hs.size(0);
 
-    constexpr int TM = 64, TN = 128, TK = 32, STAGES = 4;
+    constexpr int TM = 64, TN = 32, TK = 32, STAGES = 4;
     size_t smem_bytes =
           STAGES * TM * TK * sizeof(__nv_bfloat16)
         + STAGES * TN * TK * sizeof(__nv_bfloat16)

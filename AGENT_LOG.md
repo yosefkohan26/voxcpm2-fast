@@ -31,6 +31,88 @@ Newest entries at the **top**. Never rewrite prior entries; if you need to retra
 
 ---
 
+### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2b.2 perf tuning: TN=32 + grid=256 → 2.47× faster megakernel
+
+**Task:** Measure Step 2b.2 megakernel perf vs chained, identify bottlenecks, and optimize. User question: "what's our improvement, how many ms are we saving?"
+
+**Starting point (initial Step 2b.2 after correctness validation):**
+
+| path | p50 per layer |
+|---|---|
+| chained eager (9 kernel launches) | 355.9 µs |
+| chained graphed (9 replayed) | 97.5 µs |
+| megakernel eager (1 coop launch) | **257.3 µs** — 2.64× SLOWER than chained graphed |
+| megakernel graphed | 257.3 µs (coop launch overhead already amortized — capture doesn't help) |
+
+Integrated into the engine today, this would regress T_first by ~17 ms per DiT prefill (108 layer calls). Megakernel was a correctness foundation only.
+
+**Diagnostic #1 — cooperative-launch overhead:** Ran `mk_ext.noop(N)` (1 coop launch + 1 grid.sync + trivial 64-block write) at various N:
+
+| num_blocks | p50 | p99 |
+|---|---|---|
+| 64 | 15.1 µs | 22.9 |
+| 128 | 14.5 | 19.4 |
+| 170 | 14.4 | 20.4 |
+| 256 | 14.4 | 20.6 |
+| 340 | 14.7 | 27.3 |
+
+Flat ~15 µs regardless of block count. So grid.sync is NOT the bottleneck — fixed overhead is small and block-count-invariant.
+
+**Root cause:** Of our 257 µs, ~15 µs is overhead. Compute is ~242 µs vs chained's ~70 µs (chained 97 µs total − 27 µs for 9 launches). Compute is **3.5× slower** in the megakernel. Why? Two structural issues:
+
+1. **SMEM ceiling capped occupancy at 2 blocks/SM.** My mk_phase_gemm used TM=64, TN=128, TK=32 → 80 KB dynamic SMEM/block. At 228 KB SMEM/SM that's 2 blocks/SM. Chained's default tuned GEMM uses TN=32 → 32 KB SMEM/block, enabling higher occupancy for the same phases. Phases that don't need the SMEM at all (RMSNorm, RoPE, silu_mul) were running at the GEMM's 2-blocks/SM ceiling too, since SMEM is a per-kernel attribute.
+2. **Fixed grid = 64 blocks under-saturated the biggest phase.** gate_up GEMM at TN=32 has 256 tiles; launching only 64 blocks means each does 4 tiles serially. Chained launches 256 blocks for this op, 4× less per-block work.
+
+**Optimizations applied:**
+
+1. **`mk_phase_gemm` TN 128 → 32** (matches the chained kernel's runtime default). Dropped per-block dynamic SMEM from 80 KB to 32 KB. All 4 call sites (phase 2 qkv, phase 5 o+resid, phase 7 gate_up, phase 9 down+resid) updated. Builds against the same `mk_phase_gemm` template; only the instantiated TN changes. Numerics unchanged.
+2. **`MK_COOP_GRID` 64 → 256** (sized for the largest phase's tile count = gate_up at 256 tiles). Under-saturated phases (attention at 32 active blocks, o_proj/down_proj at 32 each) pay only the idle-block grid.sync wait — measurable but tiny.
+3. **`__launch_bounds__` tweak (128, 2) → (128, 4):** asks compiler for a tighter register budget to allow higher occupancy when the SMEM pressure goes down. Neutral at our numbers but documents the intent.
+
+**Results after tuning:**
+
+| path | p50 | vs chained graphed |
+|---|---|---|
+| chained eager | ~310 µs | — |
+| chained graphed | **97.5 µs** | reference |
+| megakernel eager (TN=128, grid=64)   [starting] | 257.3 µs | 2.64× slower |
+| megakernel eager (TN=32,  grid=64)   [step 1]  | **140.9 µs** | 1.45× slower |
+| megakernel eager (TN=32,  grid=256)  [step 2, current] | **104.1 µs** | **1.07× slower (6.6 µs gap)** |
+
+Cumulative speedup inside the megakernel: **257.3 → 104.1 µs = 2.47×**. From "2.64× slower than chained graphed" down to "6.6 µs slower" — nearly parity.
+
+**Extrapolated per full DiT prefill (108 layer calls = 12 layers × 9 Euler iterations):**
+
+| path | prefill time | vs chained graphed |
+|---|---|---|
+| chained graphed (today's engine path) | **10.53 ms** | reference |
+| megakernel (Step 2b.2 tuned, today) | **11.24 ms** | +0.71 ms (would regress) |
+| megakernel + Step 3 (12 layers/launch, projected) | ~9.75 ms | **−0.78 ms** |
+| megakernel + Step 3 + Step 4 (9 Euler/launch, projected) | ~9.62 ms | **−0.91 ms** |
+
+The projections come from eliminating 11 per-layer launches in Step 3 (11 × 15 µs = 165 µs per DiT call × 9 Euler iterations = 1.49 ms saved) and 8 Euler launches in Step 4 (8 × 15 µs = 120 µs saved). Step 2b.2 alone is still a (tiny) regression; **the megakernel strategy only wins once layers and Euler iters collapse into a single launch** (Steps 3+4).
+
+**Commands:**
+```bash
+# Bench single layer
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/benchmarks/bench_mk_dit_step2b2.py
+
+# Cooperative-launch overhead calibration
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/benchmarks/bench_mk_overhead.py
+```
+
+Regression: all 5 prior tests (scaffold, attention, step2b0, step2b1, step2b2) pass unchanged with TN=32 + grid=256.
+
+**Dead ends:**
+- Tried `__launch_bounds__(128, 4)` vs `(128, 2)` — neutral (compiler had already allocated registers for max occupancy under the lower SMEM budget).
+- Considered silu-fused down_gemm (`APPLY_SILU_MUL=true`). Chained-form note in the code says this regressed perf ~86% because the SMEM merge-pass breaks the cp.async pipeline. Deferred for later — in the megakernel with higher occupancy it might be net-positive but the payoff is ≤10 µs (saves 1 silu phase + 1 grid.sync + 1 HBM roundtrip on scratch_mid) vs the Step 3 amortization which is ~165 µs/layer — much better ROI on Step 3.
+
+**Next step:** **P2.5.2 Step 3** — 12-layer cooperative kernel. With the single-layer megakernel now within ~7 µs of chained graphed AND the cooperative-launch overhead being the only irreducible cost, fusing 12 layers into one launch eliminates 11 of those 15-µs launches. Expected: megakernel-12-layer ≈ 104 × 12 − 11 × 15 = 1083 µs/DiT-call, vs chained-graphed 12 × 97.5 = 1170 µs. First net megakernel win.
+
+---
+
 ### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2b.2: FULL 9-phase single-DiT-layer cooperative megakernel
 
 **Task:** P2.5.2 Step 2b.2 — close the full DiT layer: add RMSNorm2 + gate_up GEMM + silu_mul + down GEMM+residual to the Step 2b.1 megakernel. End state: one `cudaLaunchCooperativeKernel` = one complete DiT layer forward (all 9 phases).
