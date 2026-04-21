@@ -472,6 +472,420 @@ torch::Tensor vcpm_attention_noncausal_batched(
     return o;
 }
 
+
+// =========================================================================
+// Step 2b.0 — two-phase cooperative megakernel: RMSNorm + QKV GEMM.
+//
+// Proves the plumbing for the full 9-phase DiT megakernel (Step 2b.1+):
+//   - Cooperative launch with fixed block count.
+//   - grid.sync() between compute phases.
+//   - Per-phase work-stealing tile partitioning (a block may be busy in
+//     one phase and idle in another).
+//   - SMEM region reused across phases via `extern __shared__`.
+//
+// Work:
+//     ln_out = RMSNorm(hs,  w_in_ln)   [M, H]
+//     qkv    = ln_out @ w_qkv^T         [M, QKV_DIM]
+//
+// Output:
+//     scratch_a == ln_out     (useful for debugging; later phases overwrite)
+//     scratch_b == qkv        (what the next phase, RoPE, will consume)
+//
+// Shapes (DiT): M_padded=64 (real=22, padded with zeros), H=1024,
+//               QKV_DIM=2560. Tile layout: GEMM TM=64, TN=128, TK=32,
+//               STAGES=4 → tile grid = (20, 1) = 20 tiles.
+//
+// We launch `MK_COOP_GRID = 64` cooperative CTAs, 128 threads each. Phase 1
+// (RMSNorm) uses all 64 (one row per block). Phase 2 (GEMM) uses 20 (others
+// idle at grid.sync). Future phases (gate_up GEMM has 64 tiles) saturate
+// the 64-block grid.
+//
+// SMEM = the tuned GEMM's budget: 4×64×32×2 (A stages) + 4×128×32×2 (B
+// stages) + 64×128×4 (C fp32) = 16384 + 32768 + 32768 = 81920 B. Requires
+// cudaFuncSetAttribute(MaxDynamicSharedMemorySize) at setup.
+// =========================================================================
+
+static constexpr int MK_COOP_GRID = 64;      // fixed for Step 2b.x
+static constexpr int MK_COOP_BLOCK = 128;    // 4 warps
+
+// ---- SMEM helpers (duplicated from fused_layer_chained.cu intentionally
+// so this translation unit is self-contained; the helpers are ~30 lines
+// and re-validating them in-place is cheaper than cross-TU coupling). ----
+
+__device__ __forceinline__ uint32_t mk_smem_addr_u32(const void* ptr) {
+    uint32_t addr;
+    asm("{ .reg .u64 u64_addr; cvta.to.shared.u64 u64_addr, %1; cvt.u32.u64 %0, u64_addr; }\n"
+        : "=r"(addr) : "l"(ptr));
+    return addr;
+}
+
+__device__ __forceinline__ void mk_cp_async_16B(void* smem_dst, const void* gmem_src) {
+    uint32_t smem = mk_smem_addr_u32(smem_dst);
+    asm volatile(
+        "cp.async.ca.shared.global [%0], [%1], 16;\n"
+        :: "r"(smem), "l"(gmem_src));
+}
+
+__device__ __forceinline__ void mk_cp_async_commit() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+
+template<int N>
+__device__ __forceinline__ void mk_cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+}
+
+__device__ __forceinline__ void mk_cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n" ::);
+}
+
+
+template<int TM, int TK>
+__device__ __forceinline__ void mk_load_A_tile(
+        __nv_bfloat16* smem_A,
+        const __nv_bfloat16* __restrict__ A,
+        int block_m, int k0, int K) {
+    static_assert(TM * TK % (128 * 8) == 0, "TM*TK must be multiple of 128*8");
+    constexpr int ITERS = (TM * TK) / (128 * 8);
+    constexpr int COLS_PER_ROW = TK / 8;
+    int tid = threadIdx.x;
+    #pragma unroll
+    for (int i = 0; i < ITERS; ++i) {
+        int linear = i * 128 + tid;
+        int row = linear / COLS_PER_ROW;
+        int col = (linear % COLS_PER_ROW) * 8;
+        mk_cp_async_16B(
+            smem_A + row * TK + col,
+            A + (block_m + row) * K + (k0 + col));
+    }
+}
+
+template<int TN, int TK>
+__device__ __forceinline__ void mk_load_B_tile(
+        __nv_bfloat16* smem_B,
+        const __nv_bfloat16* __restrict__ B,
+        int block_n, int k0, int K) {
+    static_assert(TN * TK % (128 * 8) == 0, "TN*TK must be multiple of 128*8");
+    constexpr int ITERS = (TN * TK) / (128 * 8);
+    constexpr int COLS_PER_ROW = TK / 8;
+    int tid = threadIdx.x;
+    #pragma unroll
+    for (int i = 0; i < ITERS; ++i) {
+        int linear = i * 128 + tid;
+        int row = linear / COLS_PER_ROW;
+        int col = (linear % COLS_PER_ROW) * 8;
+        mk_cp_async_16B(
+            smem_B + row * TK + col,
+            B + (block_n + row) * K + (k0 + col));
+    }
+}
+
+
+// ---- Phase helpers (called from the megakernel with grid.sync between) ----
+
+// Phase: RMSNorm over [N, H] rows. Each block handles one row (blockIdx.x).
+// Blocks with blockIdx.x >= N simply return. Writes y = w * x / sqrt(mean(x^2)+eps).
+// THREADS is the block dim (we always launch 128 in this kernel, even though
+// the stride-over-H pattern only cares that THREADS divides H).
+template<int H, int THREADS>
+__device__ __forceinline__ void mk_phase_rmsnorm(
+        const __nv_bfloat16* __restrict__ x,
+        const __nv_bfloat16* __restrict__ w,
+        __nv_bfloat16* __restrict__ y,
+        int N, float eps) {
+    int tid = threadIdx.x;
+    __shared__ float sm[THREADS];
+
+    // Work-stealing over rows: each block handles rows [blockIdx.x, +gridDim.x, +2*gridDim.x, ...].
+    // Required because M can exceed gridDim.x (e.g. M=256 with grid=64).
+    for (int row = blockIdx.x; row < N; row += gridDim.x) {
+        const __nv_bfloat16* xr = x + row * H;
+        __nv_bfloat16*       yr = y + row * H;
+
+        float acc = 0.f;
+        #pragma unroll
+        for (int i = tid; i < H; i += THREADS) {
+            float v = __bfloat162float(xr[i]);
+            acc += v * v;
+        }
+        sm[tid] = acc;
+        __syncthreads();
+        for (int s = THREADS / 2; s > 0; s >>= 1) {
+            if (tid < s) sm[tid] += sm[tid + s];
+            __syncthreads();
+        }
+        float mean_sq = sm[0] / (float)H;
+        float inv = rsqrtf(mean_sq + eps);
+
+        #pragma unroll
+        for (int i = tid; i < H; i += THREADS) {
+            float v  = __bfloat162float(xr[i]);
+            float wv = __bfloat162float(w[i]);
+            yr[i] = __float2bfloat16(v * inv * wv);
+        }
+        __syncthreads();  // before reusing `sm` for the next row
+    }
+}
+
+
+// Phase: tuned bf16 GEMM tile. Each block processes one (tile_m, tile_n).
+// Work-stealing over the total tile count so blocks can pick up multiple
+// tiles if tile_count > gridDim.x. smem_raw must be the full megakernel
+// SMEM region; the GEMM aliases it as A/B stages + C fp32 staging.
+template<int TM, int TN, int TK, int STAGES>
+__device__ __forceinline__ void mk_phase_gemm(
+        const __nv_bfloat16* __restrict__ A,  // [M, K]
+        const __nv_bfloat16* __restrict__ B,  // [N, K]
+        __nv_bfloat16* __restrict__ C,        // [M, N]
+        int M, int N, int K,
+        char* smem_raw) {
+    constexpr int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
+    constexpr int WARPS = 4;
+    constexpr int N_FRAGS = TN / WMMA_N;
+    constexpr int K_SUBITERS = TK / WMMA_K;
+
+    static_assert(TM == WMMA_M * WARPS, "TM must equal WMMA_M * WARPS");
+    static_assert(TN % WMMA_N == 0, "TN must be multiple of WMMA_N");
+    static_assert(TK % WMMA_K == 0, "TK must be multiple of WMMA_K");
+
+    int tiles_m = M / TM;
+    int tiles_n = N / TN;
+    int total_tiles = tiles_m * tiles_n;
+
+    // SMEM layout (identical to fused_layer_chained tuned kernel).
+    __nv_bfloat16* smem_A = reinterpret_cast<__nv_bfloat16*>(smem_raw);
+    __nv_bfloat16* smem_B = smem_A + STAGES * TM * TK;
+    float*         smem_C = reinterpret_cast<float*>(smem_B + STAGES * TN * TK);
+
+    int warp_id = threadIdx.x >> 5;
+    int warp_m  = warp_id * WMMA_M;
+
+    // Work-stealing: each block grabs tiles with stride = gridDim.x.
+    for (int tile = blockIdx.x; tile < total_tiles; tile += gridDim.x) {
+        int tm = tile / tiles_n;
+        int tn = tile % tiles_n;
+        int block_m = tm * TM;
+        int block_n = tn * TN;
+
+        fragment<accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[N_FRAGS];
+        #pragma unroll
+        for (int i = 0; i < N_FRAGS; ++i) fill_fragment(acc[i], 0.f);
+
+        int num_k_tiles = K / TK;
+        int prologue = (STAGES - 1) < num_k_tiles ? (STAGES - 1) : num_k_tiles;
+
+        #pragma unroll
+        for (int s = 0; s < STAGES - 1; ++s) {
+            if (s < prologue) {
+                int k0 = s * TK;
+                mk_load_A_tile<TM, TK>(smem_A + s * TM * TK, A, block_m, k0, K);
+                mk_load_B_tile<TN, TK>(smem_B + s * TN * TK, B, block_n, k0, K);
+            }
+            mk_cp_async_commit();
+        }
+
+        int stage = 0;
+        for (int kt = 0; kt < num_k_tiles; ++kt) {
+            mk_cp_async_wait_group<STAGES - 2>();
+            __syncthreads();
+
+            int kt_next = kt + (STAGES - 1);
+            if (kt_next < num_k_tiles) {
+                int next_stage = (stage + STAGES - 1) % STAGES;
+                int k0_next = kt_next * TK;
+                mk_load_A_tile<TM, TK>(smem_A + next_stage * TM * TK, A, block_m, k0_next, K);
+                mk_load_B_tile<TN, TK>(smem_B + next_stage * TN * TK, B, block_n, k0_next, K);
+            }
+            mk_cp_async_commit();
+
+            __nv_bfloat16* a_base = smem_A + stage * TM * TK + warp_m * TK;
+            __nv_bfloat16* b_base = smem_B + stage * TN * TK;
+
+            #pragma unroll
+            for (int kk = 0; kk < K_SUBITERS; ++kk) {
+                int k_off = kk * WMMA_K;
+                fragment<matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, row_major> a_frag;
+                load_matrix_sync(a_frag, a_base + k_off, TK);
+
+                #pragma unroll
+                for (int ni = 0; ni < N_FRAGS; ++ni) {
+                    fragment<matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, col_major> b_frag;
+                    load_matrix_sync(b_frag, b_base + k_off + ni * WMMA_N * TK, TK);
+                    mma_sync(acc[ni], a_frag, b_frag, acc[ni]);
+                }
+            }
+
+            stage = (stage + 1) % STAGES;
+        }
+
+        mk_cp_async_wait_all();
+        __syncthreads();
+
+        #pragma unroll
+        for (int ni = 0; ni < N_FRAGS; ++ni) {
+            store_matrix_sync(smem_C + warp_m * TN + ni * WMMA_N,
+                              acc[ni], TN, mem_row_major);
+        }
+        __syncthreads();
+
+        constexpr int ELEMS_PER_THREAD = (TM * TN) / 128;
+        int tid = threadIdx.x;
+        #pragma unroll
+        for (int i = 0; i < ELEMS_PER_THREAD; ++i) {
+            int linear = i * 128 + tid;
+            int r = linear / TN;
+            int c = linear % TN;
+            int gr = block_m + r;
+            int gc = block_n + c;
+            C[gr * N + gc] = __float2bfloat16(smem_C[linear]);
+        }
+        __syncthreads();  // before next tile reuses smem_C
+    }
+}
+
+
+// ---- Step 2b.0 megakernel: RMSNorm + QKV_GEMM ----
+//
+// Shapes locked to DiT layer: H=1024, QKV_DIM=2560. M and K_gemm passed in
+// so the same kernel works for base_lm (H=2048) later.
+extern "C" __global__ __launch_bounds__(MK_COOP_BLOCK, 2)
+void mk_dit_step2b0_kernel(
+        const __nv_bfloat16* __restrict__ hs,        // [M, H]
+        const __nv_bfloat16* __restrict__ w_in_ln,   // [H]
+        const __nv_bfloat16* __restrict__ w_qkv,     // [QKV_DIM, H]
+        __nv_bfloat16* __restrict__ scratch_a,       // [M, H]  — ln_out
+        __nv_bfloat16* __restrict__ scratch_b,       // [M, QKV_DIM] — qkv
+        int M, int H, int QKV_DIM, float rms_eps) {
+    cg::grid_group grid = cg::this_grid();
+    extern __shared__ __align__(16) char smem[];
+
+    // Phase 1: ln_out = RMSNorm(hs, w_in_ln).
+    // We locked H=1024 here; a future build will template on H for base_lm.
+    mk_phase_rmsnorm<1024, MK_COOP_BLOCK>(
+        hs, w_in_ln, scratch_a, M, rms_eps);
+    grid.sync();
+
+    // Phase 2: qkv = ln_out @ w_qkv^T.
+    // (TM=64, TN=128, TK=32, STAGES=4) identical to the chained tuned GEMM.
+    mk_phase_gemm<64, 128, 32, 4>(
+        scratch_a, w_qkv, scratch_b,
+        M, QKV_DIM, H, smem);
+}
+
+
+// Launcher. Caller provides padded hs/scratch (M padded to TM=64 multiple)
+// and bf16 weights. Returns `scratch_b` = qkv_out (caller slices to real
+// rows if M has padding).
+static void mk_dit_step2b0_launch(
+        const torch::Tensor& hs,         // [M, H] bf16
+        const torch::Tensor& w_in_ln,    // [H] bf16
+        const torch::Tensor& w_qkv,      // [QKV_DIM, H] bf16
+        torch::Tensor& scratch_a,        // [M, H] bf16 (ln_out output)
+        torch::Tensor& scratch_b,        // [M, QKV_DIM] bf16 (qkv output)
+        double rms_eps) {
+    TORCH_CHECK(hs.is_cuda() && hs.dtype() == torch::kBFloat16
+                && hs.is_contiguous() && hs.dim() == 2, "hs [M,H] bf16 cuda contig");
+    TORCH_CHECK(w_in_ln.is_cuda() && w_in_ln.dtype() == torch::kBFloat16
+                && w_in_ln.is_contiguous() && w_in_ln.dim() == 1, "w_in_ln [H] bf16");
+    TORCH_CHECK(w_qkv.is_cuda() && w_qkv.dtype() == torch::kBFloat16
+                && w_qkv.is_contiguous() && w_qkv.dim() == 2, "w_qkv [QKV_DIM,H] bf16");
+    int M = (int)hs.size(0);
+    int H = (int)hs.size(1);
+    int QKV_DIM = (int)w_qkv.size(0);
+    TORCH_CHECK((int)w_qkv.size(1) == H, "w_qkv H mismatch");
+    TORCH_CHECK((int)w_in_ln.numel() == H, "w_in_ln H mismatch");
+    TORCH_CHECK(H == 1024, "Step 2b.0: only DiT H=1024 supported");
+    TORCH_CHECK(M % 64 == 0, "M must be multiple of 64");
+    TORCH_CHECK(H % 32 == 0 && QKV_DIM % 128 == 0, "H%32 QKV%128");
+
+    TORCH_CHECK(scratch_a.is_cuda() && scratch_a.dtype() == torch::kBFloat16
+                && scratch_a.is_contiguous()
+                && (int)scratch_a.size(0) == M && (int)scratch_a.size(1) == H,
+                "scratch_a [M,H] bf16 cuda contig");
+    TORCH_CHECK(scratch_b.is_cuda() && scratch_b.dtype() == torch::kBFloat16
+                && scratch_b.is_contiguous()
+                && (int)scratch_b.size(0) == M && (int)scratch_b.size(1) == QKV_DIM,
+                "scratch_b [M,QKV_DIM] bf16 cuda contig");
+
+    // SMEM sizing: driven by the GEMM (RMSNorm's tiny reduction buffer is a
+    // static __shared__ inside the __device__ function, not counted in
+    // dynamic SMEM).
+    constexpr int TM = 64, TN = 128, TK = 32, STAGES = 4;
+    size_t smem_bytes =
+          STAGES * TM * TK * sizeof(__nv_bfloat16)
+        + STAGES * TN * TK * sizeof(__nv_bfloat16)
+        + TM * TN * sizeof(float);
+
+    if (smem_bytes > 48 * 1024) {
+        cudaFuncSetAttribute(
+            mk_dit_step2b0_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
+    }
+
+    // Cooperative launch check: total blocks ≤ sm_count * blocks_per_sm.
+    int device = 0;
+    cudaGetDevice(&device);
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+
+    int blocks_per_sm = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, (const void*)mk_dit_step2b0_kernel,
+        MK_COOP_BLOCK, smem_bytes);
+    int64_t max_concurrent = (int64_t)sm_count * blocks_per_sm;
+    TORCH_CHECK(MK_COOP_GRID <= max_concurrent,
+                "cooperative limit exceeded: grid=", (int)MK_COOP_GRID,
+                " > sm_count(", sm_count, ")*per_sm(",
+                blocks_per_sm, ")=", max_concurrent,
+                ". Reduce grid or SMEM.");
+
+    // Launch args (pointers to the args must live until the launch returns;
+    // taking addresses of locals is fine here because cudaLaunchCooperative
+    // copies them synchronously into the command stream).
+    const __nv_bfloat16* hs_p     = reinterpret_cast<const __nv_bfloat16*>(hs.data_ptr());
+    const __nv_bfloat16* w_ln_p   = reinterpret_cast<const __nv_bfloat16*>(w_in_ln.data_ptr());
+    const __nv_bfloat16* w_qkv_p  = reinterpret_cast<const __nv_bfloat16*>(w_qkv.data_ptr());
+    __nv_bfloat16*       sa_p     = reinterpret_cast<__nv_bfloat16*>(scratch_a.data_ptr());
+    __nv_bfloat16*       sb_p     = reinterpret_cast<__nv_bfloat16*>(scratch_b.data_ptr());
+    float                eps      = (float)rms_eps;
+
+    void* args[] = {
+        (void*)&hs_p, (void*)&w_ln_p, (void*)&w_qkv_p,
+        (void*)&sa_p, (void*)&sb_p,
+        (void*)&M,    (void*)&H,     (void*)&QKV_DIM,
+        (void*)&eps
+    };
+
+    dim3 grid(MK_COOP_GRID);
+    dim3 block(MK_COOP_BLOCK);
+    auto stream = at::cuda::getCurrentCUDAStream();
+
+    cudaError_t err = cudaLaunchCooperativeKernel(
+        (const void*)mk_dit_step2b0_kernel,
+        grid, block, args, (size_t)smem_bytes, stream.stream());
+    TORCH_CHECK(err == cudaSuccess, "cudaLaunchCooperativeKernel failed: ",
+                cudaGetErrorString(err));
+}
+
+
+// Python-facing wrapper. Takes M-padded inputs; caller is responsible for
+// any pre/post-padding (the chained FusedLayer's _pad_M_to(64) convention).
+// Returns (ln_out, qkv) so the Python test can verify both phases.
+std::tuple<torch::Tensor, torch::Tensor> mk_dit_step2b0_rmsnorm_qkv(
+        const torch::Tensor& hs,
+        const torch::Tensor& w_in_ln,
+        const torch::Tensor& w_qkv,
+        double rms_eps) {
+    int M = (int)hs.size(0);
+    int H = (int)hs.size(1);
+    int QKV_DIM = (int)w_qkv.size(0);
+    auto opts = hs.options();
+    auto scratch_a = torch::empty({M, H},       opts);
+    auto scratch_b = torch::empty({M, QKV_DIM}, opts);
+    mk_dit_step2b0_launch(hs, w_in_ln, w_qkv, scratch_a, scratch_b, rms_eps);
+    return std::make_tuple(scratch_a, scratch_b);
+}
+
 }  // namespace voxcpm_fast
 
 
@@ -494,4 +908,16 @@ PYBIND11_MODULE(mk_dit_prefill_ext, m) {
           "(..., causal=False) within bf16 rounding.",
           pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
           pybind11::arg("scale"));
+
+    m.def("step2b0_rmsnorm_qkv",
+          &voxcpm_fast::mk_dit_step2b0_rmsnorm_qkv,
+          "P2.5.2 Step 2b.0: cooperative 2-phase megakernel — RMSNorm + QKV "
+          "GEMM with cg::this_grid().sync() between phases. Proves the "
+          "plumbing for the full 9-phase DiT megakernel. Returns "
+          "(ln_out, qkv) both bf16 [M, H] and [M, QKV_DIM]. Caller must "
+          "pre-pad M to multiple of 64.",
+          pybind11::arg("hs"),
+          pybind11::arg("w_in_ln"),
+          pybind11::arg("w_qkv"),
+          pybind11::arg("rms_eps") = 1e-6);
 }

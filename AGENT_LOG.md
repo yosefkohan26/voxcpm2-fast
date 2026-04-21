@@ -31,6 +31,73 @@ Newest entries at the **top**. Never rewrite prior entries; if you need to retra
 
 ---
 
+### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2b.0: cooperative 2-phase megakernel (RMSNorm + QKV GEMM)
+
+**Task:** P2.5.2 Step 2b.0 — ship a cooperative-launch megakernel that runs TWO real compute phases (RMSNorm then tuned QKV GEMM) separated by `cg::this_grid().sync()`. Proves the plumbing for the full 9-phase DiT megakernel end-to-end before we commit to writing it.
+
+**Files touched:**
+- `voxcpm_fast/megakernels/mk_dit_prefill.cu` — added:
+  - `mk_smem_addr_u32`, `mk_cp_async_16B`, `mk_cp_async_commit`, `mk_cp_async_wait_group`, `mk_load_A_tile`, `mk_load_B_tile` — local duplicates of the SMEM helpers from `fused_layer_chained.cu` (keeps this TU self-contained).
+  - `mk_phase_rmsnorm<H, THREADS>` __device__ helper with work-stealing over rows (`for row = blockIdx.x; row < N; row += gridDim.x`). Initial version without the stride missed rows when M > grid — caught by the M=128 test case, fixed before commit.
+  - `mk_phase_gemm<TM, TN, TK, STAGES>` __device__ helper — the existing tuned GEMM body (4-stage cp.async pipeline, WMMA 16×16×16, 4 warps) lifted as a __device__ function. Takes SMEM pointer explicitly so multiple phases can alias the same region.
+  - `mk_dit_step2b0_kernel` — cooperative `__global__` with `__launch_bounds__(128, 2)` that calls rmsnorm → grid.sync → gemm.
+  - `mk_dit_step2b0_launch` — cooperative launcher with `cudaFuncSetAttribute` for 80 KB SMEM, occupancy probe, and `cudaLaunchCooperativeKernel`.
+  - `mk_dit_step2b0_rmsnorm_qkv` Python-facing wrapper; pybind entry `step2b0_rmsnorm_qkv`.
+- `voxcpm_fast/tests/test_mk_dit_step2b0.py` — 3 numerics tests (DiT shape M=64, M=128, M=256-work-stealing) each validating BOTH ln_out and qkv outputs against chained `rmsnorm` + `gemm_bf16_tuned`.
+
+**Architecture:**
+- Cooperative grid = 64 blocks, 128 threads/block. At 80 KB SMEM per block, occupancy probe reports 2 blocks/SM → 128 max concurrent → well over our 64.
+- RMSNorm phase: each block grabs rows with stride `gridDim.x`. For M=64 each block handles exactly 1 row; for M=256 blocks handle 4 rows each.
+- GEMM phase: tile-stealing over the total `tiles_m × tiles_n` count. For QKV (M/64 × 2560/128 = 1 × 20 = 20 tiles) only blocks 0..19 compute; blocks 20..63 idle at the phase-final `__syncthreads()` then hit `grid.sync()`.
+- SMEM region (80 KB) reused via `extern __shared__`: phase 1 ignores it (uses per-block `__shared__ float sm[THREADS]` for reduction); phase 2 lays it out as 4×64×32×2 (A stages) + 4×128×32×2 (B stages) + 64×128×4 (C fp32).
+
+**Commands:**
+```bash
+# Build
+PATH=/usr/local/cuda-12.8/bin:$PATH UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  MAX_JOBS=4 nanovllm-voxcpm/.venv/bin/python voxcpm_fast/csrc/setup.py build_ext --inplace
+
+# Numerics
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/tests/test_mk_dit_step2b0.py
+
+# Regression (Step 1 scaffold + Step 2a attention must still pass)
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/tests/test_mk_dit_scaffold.py
+UV_CACHE_DIR=/workspace/Developments/VoxCPM2/.uv_cache \
+  nanovllm-voxcpm/.venv/bin/python voxcpm_fast/tests/test_mk_dit_attn_noncausal.py
+```
+
+**Results:**
+
+Numerics (vs chained rmsnorm + gemm_bf16_tuned) — all bit-exact:
+
+| shape | phase1_rmsnorm max_abs | phase2_qkv_gemm max_abs |
+|---|---|---|
+| DiT M=64 (real=22, padded) | **0.0e+00** | **0.0e+00** |
+| M=128 (2 M-tiles × 20 N-tiles = 40 tiles) | **0.0e+00** | **0.0e+00** |
+| M=256 (4 M-tiles × 20 N-tiles = 80 tiles > grid=64) | **0.0e+00** | **0.0e+00** |
+
+Bit-exactness across all three is the strongest possible proof that:
+- Cooperative launch runs the kernel without crashing or silently corrupting memory.
+- `cg::this_grid().sync()` correctly orders phase 1's writes before phase 2's reads of the same `scratch_a` buffer.
+- The per-block tile-stealing loop reaches every tile when `total_tiles > gridDim.x` (M=256 case hits 80 tiles against a 64-block grid).
+- Lifting the tuned-GEMM body from `fused_layer_chained.cu` into a __device__ function (with SMEM passed explicitly) preserves numerics 1:1.
+
+Regression: scaffold + noncausal-attention tests still pass.
+
+**Dead ends:**
+- First pass of `mk_phase_rmsnorm` used `int row = blockIdx.x; if (row >= N) return;` — single-row-per-block. Worked for M=64 but failed M=128 (rows 64..127 never computed, max_abs = 4.25 = large). Caught by the M=128 test before commit. Fixed with the row-stride loop.
+
+**Next step:** **P2.5.2 Step 2b.1** — extend this megakernel with 3 more phases: RoPE (in-place on qkv), non-causal attention (reusing the Step 2a `vcpm_attention_noncausal_batched` body as a `__device__` phase helper), and fused O_GEMM+residual (using the existing `HAS_RESIDUAL=true` template). Numerics must match chained `FusedLayer` partial-forward through o_proj. Once 2b.1 lands, 2b.2 adds RMSNorm2 + gate_up GEMM + silu + down GEMM_residual to close the full layer.
+
+**Hand-off notes:**
+- SMEM budget stays at 80 KB until the silu-fused down GEMM (+32 KB scratch). Suggest running silu as a separate phase in the megakernel to keep SMEM at 80 KB and 2 blocks/SM occupancy.
+- The attention phase needs a different SMEM layout (~30 KB: smem_q, smem_k, smem_v, smem_s, smem_p, smem_o, smem_m, smem_l). The megakernel's shared 80 KB region has plenty of room; just alias the region at phase entry. Attention's grid mapping will be different (block = (q_tile, head_q, batch)) — at DiT shape that's (1, 16, 2) = 32 blocks of the 64, which naturally falls out of `if (blockIdx.x < 32) { attn_phase(blockIdx.x / 16, blockIdx.x % 16, batch=?); }`. Or we pass a different logical-grid dispatch via the block index remapping.
+- For the GEMM+residual phase (O_proj), add `HAS_RESIDUAL=true` template flag to `mk_phase_gemm` mirroring the chained kernel's existing pattern.
+
+---
+
 ### 2026-04-21 — orchestrator (hands-on) — P2.5.2 Step 2a: non-causal batched attention kernel
 
 **Task:** P2.5.2 Step 2a — ship the non-causal batched attention primitive that the future DiT megakernel (Steps 2b–4) will call as a __device__ sub-phase. Standalone first so we can numerics-validate in isolation before the cooperative-kernel complexity.
